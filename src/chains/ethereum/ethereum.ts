@@ -184,18 +184,20 @@ export class Ethereum {
           const block = await this.provider.getBlock('latest');
           const baseFee = block.baseFeePerGas || BigNumber.from('0');
 
-          // Calculate recommended maxFeePerGas as 2 * baseFee + maxPriorityFeePerGas
-          const recommendedMaxFee = baseFee.mul(2).add(feeData.maxPriorityFeePerGas);
-
-          // Use the higher of network estimate or our calculation
-          const maxFeePerGas = feeData.maxFeePerGas.gt(recommendedMaxFee) ? feeData.maxFeePerGas : recommendedMaxFee;
+          // Apply conservative buffers to keep costs low on low-cost chains (e.g. Base)
+          const priorityCap = utils.parseUnits('0.05', 'gwei'); // 0.05 gwei upper bound
+          const cappedPriority = feeData.maxPriorityFeePerGas.gt(priorityCap)
+            ? priorityCap
+            : feeData.maxPriorityFeePerGas;
+          const scaledBaseFee = baseFee.mul(12).div(10); // base fee + 20% headroom
+          const maxFeePerGas = scaledBaseFee.add(cappedPriority);
 
           gasOptions.type = 2;
           gasOptions.maxFeePerGas = maxFeePerGas;
-          gasOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+          gasOptions.maxPriorityFeePerGas = cappedPriority;
 
           logger.info(
-            `Using EIP-1559 pricing: baseFee=${utils.formatUnits(baseFee, 'gwei')} GWEI, maxFee=${utils.formatUnits(maxFeePerGas, 'gwei')} GWEI, priority=${utils.formatUnits(feeData.maxPriorityFeePerGas, 'gwei')} GWEI`,
+            `Using EIP-1559 pricing: baseFee=${utils.formatUnits(baseFee, 'gwei')} GWEI, maxFee=${utils.formatUnits(maxFeePerGas, 'gwei')} GWEI, priority=${utils.formatUnits(cappedPriority, 'gwei')} GWEI`,
           );
 
           return gasOptions;

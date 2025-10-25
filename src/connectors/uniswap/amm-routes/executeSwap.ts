@@ -15,7 +15,7 @@ import { formatTokenAmount } from '../uniswap.utils';
 import { getUniswapAmmQuote } from './quoteSwap';
 
 // Default gas limit for AMM swap operations
-const AMM_SWAP_GAS_LIMIT = 300000;
+const AMM_SWAP_GAS_LIMIT = 180000;
 
 export async function executeAmmSwap(
   fastify: FastifyInstance,
