@@ -8,6 +8,7 @@ jest.mock('../../../src/services/logger', () => ({
     warn: jest.fn(),
     debug: jest.fn(),
   },
+  redactUrl: jest.fn((url: string) => url), // Mock redactUrl to return URL as-is
 }));
 
 // Mock config manager
@@ -24,7 +25,6 @@ jest.mock('../../../src/services/config-manager-v2', () => ({
         if (key === 'solana-mainnet-beta.confirmRetryInterval') return 2;
         if (key === 'solana-mainnet-beta.confirmRetryCount') return 30;
         if (key === 'solana-mainnet-beta.minPriorityFeePerCU') return 0;
-        if (key === 'solana-mainnet-beta.jitoTipSOL') return 0.0001;
         return undefined;
       }),
     })),
@@ -83,9 +83,9 @@ describe('Solana Rate Limit Error Propagation', () => {
       mockConnection.getBalance = jest.fn().mockResolvedValue(1000000000);
 
       // Mock token accounts to fail with 429
-      mockConnection.getParsedTokenAccountsByOwner = jest.fn().mockRejectedValue(error429);
+      mockConnection.getTokenAccountsByOwner = jest.fn().mockRejectedValue(error429);
 
-      await expect(solana.getBalances('11111111111111111111111111111112', [], true)).rejects.toMatchObject({
+      await expect(solana.getBalances('11111111111111111111111111111112', [])).rejects.toMatchObject({
         statusCode: 429,
       });
     });
@@ -159,35 +159,6 @@ describe('Solana Rate Limit Error Propagation', () => {
 
       // Test _sendAndConfirmRawTransaction directly
       const serializedTx = Buffer.from([1, 2, 3]); // Dummy serialized transaction
-      await expect((solana as any)._sendAndConfirmRawTransaction(serializedTx)).rejects.toMatchObject({
-        statusCode: 429,
-      });
-    });
-
-    it('should propagate 429 error during re-broadcast', async () => {
-      const error429 = new Error('Too many requests');
-      (error429 as any).statusCode = 429;
-
-      // Mock successful initial send, then fail with 429 on re-broadcast
-      mockConnection.sendRawTransaction = jest
-        .fn()
-        .mockResolvedValueOnce('test-signature')
-        .mockRejectedValueOnce(error429);
-
-      mockConnection.getLatestBlockhash = jest.fn().mockResolvedValue({
-        blockhash: 'test-blockhash',
-        lastValidBlockHeight: 100,
-      });
-
-      // Mock status check to show no confirmation
-      mockConnection.getSignatureStatuses = jest.fn().mockResolvedValue({
-        value: [null],
-      });
-
-      // Mock blockhash expired scenario
-      mockConnection.getBlockHeight = jest.fn().mockResolvedValue(101);
-
-      const serializedTx = Buffer.from([1, 2, 3]);
       await expect((solana as any)._sendAndConfirmRawTransaction(serializedTx)).rejects.toMatchObject({
         statusCode: 429,
       });

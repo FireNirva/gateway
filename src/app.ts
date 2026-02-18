@@ -19,6 +19,7 @@ import { configRoutes } from './config/config.routes';
 import { register0xRoutes } from './connectors/0x/0x.routes';
 import { jupiterRoutes } from './connectors/jupiter/jupiter.routes';
 import { meteoraRoutes } from './connectors/meteora/meteora.routes';
+import { orcaRoutes } from './connectors/orca/orca.routes';
 import { pancakeswapRoutes } from './connectors/pancakeswap/pancakeswap.routes';
 import { pancakeswapSolRoutes } from './connectors/pancakeswap-sol/pancakeswap-sol.routes';
 import { raydiumRoutes } from './connectors/raydium/raydium.routes';
@@ -28,6 +29,7 @@ import { poolRoutes } from './pools/pools.routes';
 import { ConfigManagerV2 } from './services/config-manager-v2';
 import { logger } from './services/logger';
 import { quoteCache } from './services/quote-cache';
+import { displayChainConfigurations } from './services/startup-banner';
 import { tokensRoutes } from './tokens/tokens.routes';
 import { tradingRoutes, tradingClmmRoutes } from './trading/trading.routes';
 import { GATEWAY_VERSION } from './version';
@@ -84,6 +86,10 @@ const swaggerOptions = {
       {
         name: '/connector/meteora',
         description: 'Meteora connector endpoints',
+      },
+      {
+        name: '/connector/orca',
+        description: 'Orca connector endpoints',
       },
       {
         name: '/connector/raydium',
@@ -245,6 +251,9 @@ const configureGatewayServer = () => {
     // Meteora routes
     app.register(meteoraRoutes.clmm, { prefix: '/connectors/meteora/clmm' });
 
+    // // Orca routes
+    app.register(orcaRoutes.clmm, { prefix: '/connectors/orca/clmm' });
+
     // Raydium routes
     app.register(raydiumRoutes.amm, { prefix: '/connectors/raydium/amm' });
     app.register(raydiumRoutes.clmm, { prefix: '/connectors/raydium/clmm' });
@@ -288,6 +297,7 @@ const configureGatewayServer = () => {
   server.setErrorHandler((error, request, reply) => {
     // Handle validation errors
     if ('validation' in error && error.validation) {
+      logger.warn(`Validation error on ${request.method} ${request.url}: ${error.message}`);
       return reply.status(400).send({
         statusCode: 400,
         error: 'Validation Error',
@@ -410,6 +420,9 @@ export const startGateway = async () => {
     const docsUrl = docsPort ? `http://localhost:${docsPort}` : `${protocol}://localhost:${port}/docs`;
 
     logger.info(`📓 Documentation available at ${docsUrl}`);
+
+    // Display chain configurations now that server has started
+    displayChainConfigurations();
 
     // Set up graceful shutdown
     const shutdown = async () => {

@@ -4,7 +4,6 @@ import { FastifyInstance } from 'fastify';
 import '../../../mocks/app-mocks';
 
 import { gatewayApp } from '../../../../src/app';
-import { HeliusService } from '../../../../src/chains/solana/helius-service';
 import { getSolanaStatus } from '../../../../src/chains/solana/routes/status';
 import { Solana } from '../../../../src/chains/solana/solana';
 
@@ -44,11 +43,11 @@ describe('Solana Status Route', () => {
         swapProvider: 'jupiter/router',
       },
       getCurrentBlockNumber: jest.fn(),
-      getHeliusService: jest.fn(),
+      getRpcProviderService: jest.fn(),
     };
 
-    const mockHeliusService = {
-      getUrlForNetwork: jest.fn(),
+    const mockRpcProviderService = {
+      getHttpUrl: jest.fn(),
     };
 
     beforeEach(() => {
@@ -76,15 +75,15 @@ describe('Solana Status Route', () => {
       });
     });
 
-    it('should return status with Helius URL when rpcProvider is "helius" and service is available', async () => {
+    it('should return status with provider URL when rpcProvider service is available', async () => {
       getSolanaChainConfig.mockReturnValue({
         defaultNetwork: 'mainnet-beta',
         defaultWallet: 'test-wallet',
         rpcProvider: 'helius',
       });
 
-      mockSolanaInstance.getHeliusService.mockReturnValue(mockHeliusService);
-      mockHeliusService.getUrlForNetwork.mockReturnValue('https://mainnet.helius-rpc.com/?api-key=test-key');
+      mockSolanaInstance.getRpcProviderService.mockReturnValue(mockRpcProviderService);
+      mockRpcProviderService.getHttpUrl.mockReturnValue('https://mainnet.helius-rpc.com/?api-key=test-key');
 
       const result = await getSolanaStatus(fastify, 'mainnet-beta');
 
@@ -98,17 +97,17 @@ describe('Solana Status Route', () => {
         swapProvider: 'jupiter/router',
       });
 
-      expect(mockHeliusService.getUrlForNetwork).toHaveBeenCalledWith('mainnet-beta');
+      expect(mockRpcProviderService.getHttpUrl).toHaveBeenCalled();
     });
 
-    it('should fallback to nodeURL when rpcProvider is "helius" but service is not available', async () => {
+    it('should fallback to nodeURL when rpcProvider service is not available', async () => {
       getSolanaChainConfig.mockReturnValue({
         defaultNetwork: 'mainnet-beta',
         defaultWallet: 'test-wallet',
         rpcProvider: 'helius',
       });
 
-      mockSolanaInstance.getHeliusService.mockReturnValue(null);
+      mockSolanaInstance.getRpcProviderService.mockReturnValue(null);
 
       const result = await getSolanaStatus(fastify, 'mainnet-beta');
 
@@ -123,16 +122,16 @@ describe('Solana Status Route', () => {
       });
     });
 
-    it('should fallback to nodeURL when Helius service throws error', async () => {
+    it('should fallback to nodeURL when RPC provider service throws error', async () => {
       getSolanaChainConfig.mockReturnValue({
         defaultNetwork: 'mainnet-beta',
         defaultWallet: 'test-wallet',
         rpcProvider: 'helius',
       });
 
-      mockSolanaInstance.getHeliusService.mockReturnValue(mockHeliusService);
-      mockHeliusService.getUrlForNetwork.mockImplementation(() => {
-        throw new Error('Helius service error');
+      mockSolanaInstance.getRpcProviderService.mockReturnValue(mockRpcProviderService);
+      mockRpcProviderService.getHttpUrl.mockImplementation(() => {
+        throw new Error('RPC provider service error');
       });
 
       // Mock logger.warn to avoid console output during tests
@@ -150,7 +149,9 @@ describe('Solana Status Route', () => {
         swapProvider: 'jupiter/router',
       });
 
-      expect(mockWarn).toHaveBeenCalledWith('Failed to get Helius URL, using nodeURL: Helius service error');
+      expect(mockWarn).toHaveBeenCalledWith(
+        'Failed to get RPC provider URL, using nodeURL: RPC provider service error',
+      );
 
       mockWarn.mockRestore();
     });
@@ -175,7 +176,7 @@ describe('Solana Status Route', () => {
       });
     });
 
-    it('should handle devnet network with Helius provider', async () => {
+    it('should handle devnet network with RPC provider', async () => {
       getSolanaChainConfig.mockReturnValue({
         defaultNetwork: 'devnet',
         defaultWallet: 'test-wallet',
@@ -183,8 +184,8 @@ describe('Solana Status Route', () => {
       });
 
       mockSolanaInstance.config.nodeURL = 'https://api.devnet.solana.com';
-      mockSolanaInstance.getHeliusService.mockReturnValue(mockHeliusService);
-      mockHeliusService.getUrlForNetwork.mockReturnValue('https://devnet.helius-rpc.com/?api-key=test-key');
+      mockSolanaInstance.getRpcProviderService.mockReturnValue(mockRpcProviderService);
+      mockRpcProviderService.getHttpUrl.mockReturnValue('https://devnet.helius-rpc.com/?api-key=test-key');
 
       const result = await getSolanaStatus(fastify, 'devnet');
 
@@ -198,7 +199,7 @@ describe('Solana Status Route', () => {
         swapProvider: 'jupiter/router',
       });
 
-      expect(mockHeliusService.getUrlForNetwork).toHaveBeenCalledWith('devnet');
+      expect(mockRpcProviderService.getHttpUrl).toHaveBeenCalled();
     });
   });
 
@@ -210,13 +211,13 @@ describe('Solana Status Route', () => {
         swapProvider: 'jupiter/router',
       },
       getCurrentBlockNumber: jest.fn(),
-      getHeliusService: jest.fn(),
+      getRpcProviderService: jest.fn(),
     };
 
     beforeEach(() => {
       mockSolana.getInstance.mockResolvedValue(mockSolanaInstance as any);
       mockSolanaInstance.getCurrentBlockNumber.mockResolvedValue(365795000);
-      mockSolanaInstance.getHeliusService.mockReturnValue(null);
+      mockSolanaInstance.getRpcProviderService.mockReturnValue(null);
 
       getSolanaChainConfig.mockReturnValue({
         defaultNetwork: 'mainnet-beta',

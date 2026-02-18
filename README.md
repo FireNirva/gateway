@@ -291,57 +291,75 @@ To start the Gateway server in HTTPS mode, run the command without the `--dev` f
 pnpm start --passphrase=<PASSPHRASE>
 ```
 
-## Installation with Docker
+## Installation with Docker Compose
 
-### Step 1: Get the Docker Image
+### Prerequisites
 
-**Option A: Pull from Docker Hub**
+Install [Docker Compose](https://docs.docker.com/compose/install/) if you haven't already.
+
+### Step 1: Clone the Repository
+
 ```bash
-# Note: This image will be available after the v2.8 release
-docker pull hummingbot/gateway:latest
+# Clone Github repo
+git clone https://github.com/hummingbot/gateway.git
+
+# Navigate to the directory
+cd gateway
+
+# Switch to core-2.8 branch
+git checkout core-2.8
 ```
 
-**Option B: Build locally**
-```bash
-# Simple build
-docker build -t hummingbot/gateway:core-2.8 .
+### Step 2: Configure Environment Variables
 
-# Build with version tag and metadata
-docker build \
-  --build-arg BRANCH=$(git rev-parse --abbrev-ref HEAD) \
-  --build-arg COMMIT=$(git rev-parse HEAD) \
-  --build-arg BUILD_DATE=$(date -u +"%Y-%m-%d") \
-  -t hummingbot/gateway:core-2.8 .
+Edit `docker-compose.yml` to set your desired configuration:
+
+```yaml
+environment:
+  - GATEWAY_PASSPHRASE=a # Replace with a strong passphrase
+  - DEV=true # Set to false for HTTPS mode (requires certificates)
 ```
 
-### Step 2: Run the Gateway Container
+**Development mode (DEV=true)**:
+- Runs HTTP endpoints without SSL encryption
+- No certificate requirements
+- Ideal for local development and testing
 
-**Development mode (Unencrypted HTTP endpoints, default):**
+**Production mode (DEV=false)**:
+- Requires SSL certificates in the `certs/` directory
+- Runs HTTPS endpoints with encryption
+- Required for production deployments and Hummingbot client integration
+
+### Step 3: Launch Gateway
+
 ```bash
-docker run -p 15888:15888 \
-  -e GATEWAY_PASSPHRASE=admin \
-  -e GATEWAY_DEV=true \
-  -v $(pwd)/conf:/home/gateway/conf \
-  -v $(pwd)/logs:/home/gateway/logs \
-  hummingbot/gateway:core-2.8
+# Start Gateway in detached mode
+docker compose up -d
+
+# View logs to confirm Gateway is running
+docker compose logs -f gateway
 ```
 
-**Production mode (Encrypted HTTPS endpoints, requires Hummingbot certs):**
-```bash
-docker run -p 15888:15888 \
-  -e GATEWAY_PASSPHRASE=a \
-  -e GATEWAY_DEV=false \
-  -v $(pwd)/conf:/home/gateway/conf \
-  -v $(pwd)/logs:/home/gateway/logs \
-  -v $(pwd)/certs:/home/gateway/certs \
-  hummingbot/gateway:core-2.8
-```
-
-### Access Points
-
+Gateway will start and be accessible at:
 - Development mode: http://localhost:15888
-- Production mode: https://localhost:15888  
+- Production mode: https://localhost:15888
 - Swagger API docs: http://localhost:15888/docs (dev mode only)
+
+### Managing the Gateway Container
+
+```bash
+# Stop Gateway
+docker compose down
+
+# Restart Gateway
+docker compose restart
+
+# View logs
+docker compose logs -f gateway
+
+# Rebuild and restart (after code changes)
+docker compose up -d --build
+```
 
 
 ## API Endpoints Overview
@@ -452,43 +470,39 @@ The migration script will:
 
 After migration, review the updated template files to ensure all pools were successfully migrated before committing changes.
 
+### API Keys Configuration
+
+All external service API keys are centralized in `conf/apiKeys.yml`:
+
+```yaml
+# Helius - Solana RPC provider (https://helius.dev)
+helius: 'your_helius_api_key'
+
+# Infura - Ethereum RPC provider (https://infura.io)
+infura: 'your_infura_api_key'
+
+# CoinGecko - Price data (https://www.coingecko.com/en/api/pricing)
+coingecko: 'your_coingecko_api_key'
+
+# Etherscan - Gas price estimates (https://etherscan.io/myapikey)
+etherscan: 'your_etherscan_api_key'
+
+# Jupiter - Solana DEX aggregator (https://portal.jup.ag)
+jupiter: 'your_jupiter_api_key'
+```
+
 ### RPC Provider Configuration
 
 Gateway supports optimized RPC providers for enhanced performance:
 
-#### **Infura Configuration (Ethereum Networks)**
-1. **Configure API Key**: Add your Infura API key to `conf/rpc/infura.yml`:
-   ```yaml
-   apiKey: 'your_infura_api_key_here'
-   useWebSocket: true
-   ```
-
-2. **Enable for Networks**: Set `rpcProvider: infura` in network configurations:
-   ```yaml
-   # In conf/chains/ethereum/mainnet.yml
-   chainID: 1
-   nodeURL: https://eth.llamarpc.com  # fallback URL
-   rpcProvider: infura
-   ```
-
+#### **Infura (Ethereum Networks)**
+1. **Configure API Key**: Add your Infura API key to `conf/apiKeys.yml`
+2. **Enable for Networks**: Set `rpcProvider: infura` in `conf/chains/ethereum.yml`
 3. **Supported Networks**: Mainnet, Polygon, Arbitrum, Optimism, Base, Avalanche
 
-#### **Helius Configuration (Solana Networks)**
-1. **Configure API Key**: Add your Helius API key to `conf/rpc/helius.yml`:
-   ```yaml
-   apiKey: 'your_helius_api_key_here'
-   useWebSocketRPC: true
-   useSender: true
-   regionCode: 'slc'  # Optional: slc, ewr, lon, fra, ams, sg, tyo
-   ```
-
-2. **Enable for Networks**: Set `rpcProvider: helius` in network configurations:
-   ```yaml
-   # In conf/chains/solana/mainnet-beta.yml
-   nodeURL: https://api.mainnet-beta.solana.com  # fallback URL
-   rpcProvider: helius
-   ```
-
+#### **Helius (Solana Networks)**
+1. **Configure API Key**: Add your Helius API key to `conf/apiKeys.yml`
+2. **Enable for Networks**: Set `rpcProvider: helius` in `conf/chains/solana.yml`
 3. **Supported Networks**: Mainnet-Beta, Devnet
 
 #### **Benefits of RPC Provider Integration**
@@ -693,13 +707,10 @@ Gateway's RPC provider abstraction allows integration of optimized RPC services.
    ```yaml
    # MyProvider RPC Configuration
    # Get your API key from https://myprovider.com
-   
+
    # Required: Your MyProvider API key
    apiKey: ''
-   
-   # Optional: Enable WebSocket connections
-   useWebSocket: true
-   
+
    # Optional: Provider-specific settings
    region: 'us-east'
    rateLimit: 100
@@ -714,11 +725,6 @@ Gateway's RPC provider abstraction allows integration of optimized RPC services.
          "type": "string",
          "minLength": 1,
          "description": "MyProvider API key"
-       },
-       "useWebSocket": {
-         "type": "boolean",
-         "default": true,
-         "description": "Enable WebSocket connections"
        },
        "region": {
          "type": "string",
@@ -855,20 +861,14 @@ export class MyProviderService {
      private initializeMyProvider(config: ChainNetworkConfig): void {
        try {
          const apiKey = ConfigManagerV2.getInstance().get('myprovider.apiKey');
-         
+
          if (!apiKey || apiKey.trim() === '') {
            logger.warn('MyProvider selected but no API key, using standard RPC');
            this.provider = new providers.StaticJsonRpcProvider(config.nodeURL);
            return;
          }
-         
-         const mergedConfig = {
-           ...config,
-           myProviderAPIKey: apiKey,
-           useMyProviderWebSocket: ConfigManagerV2.getInstance().get('myprovider.useWebSocket')
-         };
-         
-         this.myProviderService = new MyProviderService(mergedConfig);
+
+         this.myProviderService = new MyProviderService({ apiKey }, networkInfo);
          this.provider = this.myProviderService.getProvider();
          
        } catch (error: any) {

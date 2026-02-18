@@ -3,10 +3,10 @@ import { PublicKey } from '@solana/web3.js';
 import { FastifyPluginAsync, FastifyInstance } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
-import { PositionInfo, PositionInfoSchema, GetPositionsOwnedRequestType } from '../../../schemas/clmm-schema';
+import { PositionInfo, PositionInfoSchema } from '../../../schemas/clmm-schema';
 import { logger } from '../../../services/logger';
-import { PancakeswapSol, PANCAKESWAP_CLMM_PROGRAM_ID } from '../pancakeswap-sol';
-import { PancakeswapSolClmmGetPositionsOwnedRequest } from '../schemas';
+import { PancakeswapSol } from '../pancakeswap-sol';
+import { PancakeswapSolClmmGetPositionsOwnedRequest, PancakeswapSolClmmGetPositionsOwnedRequestType } from '../schemas';
 
 const INVALID_SOLANA_ADDRESS_MESSAGE = (address: string) => `Invalid Solana address: ${address}`;
 
@@ -18,16 +18,44 @@ export async function getPositionsOwned(
   fastify: FastifyInstance,
   network: string,
   walletAddress: string,
+  poolAddress?: string,
 ): Promise<PositionInfo[]> {
   const solana = await Solana.getInstance(network);
-  const pancakeswapSol = await PancakeswapSol.getInstance(network);
 
   // Validate wallet address
   try {
     new PublicKey(walletAddress);
-  } catch (error) {
-    throw fastify.httpErrors.badRequest(INVALID_SOLANA_ADDRESS_MESSAGE('wallet'));
+  } catch {
+    throw fastify.httpErrors.badRequest(`Invalid wallet address: ${walletAddress}`);
   }
+
+  // Validate pool address if provided
+  if (poolAddress) {
+    try {
+      new PublicKey(poolAddress);
+    } catch {
+      throw fastify.httpErrors.badRequest(`Invalid pool address: ${poolAddress}`);
+    }
+  }
+
+  // Fetch from RPC (positions are cached individually by position address, not by wallet)
+  let positions = await fetchPositionsFromRPC(solana, walletAddress);
+
+  // Filter by poolAddress if provided
+  if (poolAddress) {
+    positions = positions.filter((pos) => pos.poolAddress === poolAddress);
+  }
+
+  // Populate cache for each position individually using "connector:clmm:address" format
+
+  return positions;
+}
+
+/**
+ * Fetch positions from RPC
+ */
+async function fetchPositionsFromRPC(solana: Solana, walletAddress: string): Promise<PositionInfo[]> {
+  const pancakeswapSol = await PancakeswapSol.getInstance(solana.network);
 
   logger.info(`Fetching all positions for wallet ${walletAddress}`);
 
@@ -46,34 +74,47 @@ export async function getPositionsOwned(
 
   // Filter for NFT token accounts (amount = 1, decimals = 0)
   const nftAccounts = allTokenAccounts.filter((account) => {
-    const amount = account.account.data.parsed.info.tokenAmount.uiAmount;
-    const decimals = account.account.data.parsed.info.tokenAmount.decimals;
-    return amount === 1 && decimals === 0;
+    try {
+      const parsed = account.account.data.parsed;
+      const tokenAmount = parsed?.info?.tokenAmount;
+      // NFT positions have amount = 1 and decimals = 0
+      return tokenAmount && tokenAmount.uiAmount === 1 && tokenAmount.decimals === 0;
+    } catch (error) {
+      logger.debug(`Failed to parse token account:`, error);
+      return false;
+    }
   });
 
-  logger.info(`Found ${nftAccounts.length} NFT token accounts`);
+  logger.debug(`Found ${nftAccounts.length} NFT token accounts, checking for positions...`);
 
   // Fetch position info for each NFT
   const positions: PositionInfo[] = [];
   for (const nftAccount of nftAccounts) {
     try {
-      const mint = nftAccount.account.data.parsed.info.mint;
+      // Get the mint address from parsed data
+      const mint = nftAccount.account.data.parsed?.info?.mint;
+      if (!mint) {
+        logger.debug(`Skipping token account without mint`);
+        continue;
+      }
+
       const positionInfo = await pancakeswapSol.getPositionInfo(mint);
       if (positionInfo) {
         positions.push(positionInfo);
       }
     } catch (error) {
-      logger.debug(`Skipping non-position NFT: ${nftAccount.account.data.parsed.info.mint}`);
+      // Skip NFTs that aren't positions - this is expected
+      logger.debug(`Skipping non-position NFT`);
     }
   }
 
-  logger.info(`Found ${positions.length} total positions`);
+  logger.info(`Found ${positions.length} PancakeSwap position(s) for wallet ${walletAddress.slice(0, 8)}...`);
   return positions;
 }
 
 export const positionsOwnedRoute: FastifyPluginAsync = async (fastify) => {
   fastify.get<{
-    Querystring: GetPositionsOwnedRequestType;
+    Querystring: PancakeswapSolClmmGetPositionsOwnedRequestType;
     Reply: GetPositionsOwnedResponseType;
   }>(
     '/positions-owned',
@@ -89,8 +130,8 @@ export const positionsOwnedRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { network = 'mainnet-beta', walletAddress } = request.query;
-        return await getPositionsOwned(fastify, network, walletAddress);
+        const { network = 'mainnet-beta', walletAddress, poolAddress } = request.query;
+        return await getPositionsOwned(fastify, network, walletAddress, poolAddress);
       } catch (e: any) {
         logger.error('Positions owned error:', e);
         // Re-throw httpErrors as-is

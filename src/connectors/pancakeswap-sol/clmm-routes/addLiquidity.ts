@@ -1,25 +1,26 @@
 import { Static } from '@sinclair/typebox';
 import { PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { AddLiquidityResponse, AddLiquidityResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { PancakeswapSol } from '../pancakeswap-sol';
+import { PancakeswapSolConfig } from '../pancakeswap-sol.config';
 import { buildAddLiquidityTransaction } from '../pancakeswap-sol.transactions';
 import { PancakeswapSolClmmAddLiquidityRequest } from '../schemas';
 
 import { quotePosition } from './quotePosition';
 
 export async function addLiquidity(
-  _fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
   baseTokenAmount: number,
   quoteTokenAmount: number,
-  slippagePct?: number,
+  slippagePct: number = PancakeswapSolConfig.config.slippagePct,
 ): Promise<AddLiquidityResponseType> {
   const solana = await Solana.getInstance(network);
   const pancakeswapSol = await PancakeswapSol.getInstance(network);
@@ -27,7 +28,7 @@ export async function addLiquidity(
   // Get position info
   const positionInfo = await pancakeswapSol.getPositionInfo(positionAddress);
   if (!positionInfo) {
-    throw _fastify.httpErrors.notFound(`Position not found: ${positionAddress}`);
+    throw httpErrors.notFound(`Position not found: ${positionAddress}`);
   }
 
   const wallet = await solana.getWallet(walletAddress);
@@ -39,13 +40,12 @@ export async function addLiquidity(
   const quoteToken = await solana.getToken(positionInfo.quoteTokenAddress);
 
   if (!baseToken || !quoteToken) {
-    throw _fastify.httpErrors.notFound('Token information not found');
+    throw httpErrors.notFound('Token information not found');
   }
 
   // Get quote for position amounts (same as Raydium approach)
   // This calculates proper amounts based on position's tick range and current pool price
   const quote = await quotePosition(
-    _fastify,
     network,
     positionInfo.lowerPrice,
     positionInfo.upperPrice,
@@ -64,7 +64,7 @@ export async function addLiquidity(
   logger.info(`Quote Liquidity: ${quote.liquidity}`);
 
   // Apply slippage buffer (same as openPosition and Raydium)
-  const effectiveSlippage = slippagePct || 1.0;
+  const effectiveSlippage = slippagePct ?? PancakeswapSolConfig.config.slippagePct;
   const amount0Max = new BN(
     (quote.baseTokenAmountMax * (1 + effectiveSlippage / 100) * 10 ** baseToken.decimals).toFixed(0),
   );
@@ -98,7 +98,7 @@ export async function addLiquidity(
 
   // Sign and send
   transaction.sign([wallet]);
-  await solana.simulateWithErrorHandling(transaction, _fastify);
+  await solana.simulateWithErrorHandling(transaction);
 
   const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction);
 
@@ -164,7 +164,6 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         } = request.body;
 
         return await addLiquidity(
-          fastify,
           network,
           walletAddress!,
           positionAddress,
@@ -180,7 +179,7 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         }
         // Handle unknown errors
         const errorMessage = e.message || 'Failed to add liquidity';
-        throw fastify.httpErrors.internalServerError(errorMessage);
+        throw httpErrors.internalServerError(errorMessage);
       }
     },
   );

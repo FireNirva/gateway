@@ -6,8 +6,6 @@ import {
   NATIVE_MINT,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
-  createSyncNativeInstruction,
-  createCloseAccountInstruction,
 } from '@solana/spl-token';
 import {
   PublicKey,

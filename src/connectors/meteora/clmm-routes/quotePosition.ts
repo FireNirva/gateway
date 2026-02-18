@@ -1,23 +1,23 @@
 import { StrategyType, getPriceOfBinByBinId } from '@meteora-ag/dlmm';
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { QuotePositionResponseType, QuotePositionResponse } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraConfig } from '../meteora.config';
 import { MeteoraClmmQuotePositionRequest } from '../schemas';
 
 export async function quotePosition(
-  _fastify: FastifyInstance,
   network: string,
   lowerPrice: number,
   upperPrice: number,
   poolAddress: string,
   baseTokenAmount?: number,
   quoteTokenAmount?: number,
-  slippagePct?: number,
+  slippagePct: number = MeteoraConfig.config.slippagePct,
   strategyType?: StrategyType,
 ): Promise<QuotePositionResponseType> {
   try {
@@ -35,15 +35,15 @@ export async function quotePosition(
     const lowerBinId = dlmmPool.getBinIdFromPrice(lowerPrice, false);
     const upperBinId = dlmmPool.getBinIdFromPrice(upperPrice, true);
 
-    // Use provided strategy type or default to SpotBalanced
+    // Use provided strategy type or default to Spot
     const strategy = {
       minBinId: Math.min(lowerBinId, upperBinId),
       maxBinId: Math.max(lowerBinId, upperBinId),
-      strategyType: strategyType ?? StrategyType.SpotBalanced,
+      strategyType: strategyType ?? StrategyType.Spot,
     };
 
     // Get token amounts needed for the position
-    const slippage = (slippagePct === 0 ? 0 : slippagePct || MeteoraConfig.config.slippagePct) / 100;
+    const slippage = slippagePct / 100;
 
     // Calculate liquidity distribution if amounts are provided
     let baseAmount = 0;
@@ -56,7 +56,7 @@ export async function quotePosition(
     if (baseTokenAmount || quoteTokenAmount) {
       // Get current price adjusted for decimals
       const rawPrice = getPriceOfBinByBinId(activeBinId, binStep).toNumber();
-      const decimalDiff = dlmmPool.tokenX.decimal - dlmmPool.tokenY.decimal;
+      const decimalDiff = dlmmPool.tokenX.mint.decimals - dlmmPool.tokenY.mint.decimals;
       const adjustmentFactor = Math.pow(10, decimalDiff);
       const currentPrice = rawPrice * adjustmentFactor;
 
@@ -99,8 +99,8 @@ export async function quotePosition(
       // For DLMM pools, liquidity is distributed across bins based on the strategy
       // We'll estimate it based on the token amounts in lamports
       try {
-        const tokenXAmountLamports = baseAmount * Math.pow(10, dlmmPool.tokenX.decimal);
-        const tokenYAmountLamports = quoteAmount * Math.pow(10, dlmmPool.tokenY.decimal);
+        const tokenXAmountLamports = baseAmount * Math.pow(10, dlmmPool.tokenX.mint.decimals);
+        const tokenYAmountLamports = quoteAmount * Math.pow(10, dlmmPool.tokenY.mint.decimals);
 
         // For a balanced position, liquidity can be approximated as the geometric mean
         // This is a simplified estimate; actual distribution depends on bin strategy
@@ -155,7 +155,6 @@ export const quotePositionRoute: FastifyPluginAsync = async (fastify) => {
         } = request.query;
 
         return await quotePosition(
-          fastify,
           network,
           lowerPrice,
           upperPrice,
@@ -167,7 +166,10 @@ export const quotePositionRoute: FastifyPluginAsync = async (fastify) => {
         );
       } catch (e) {
         logger.error(e);
-        throw fastify.httpErrors.internalServerError('Failed to quote position');
+        if (e.statusCode) {
+          throw e; // Re-throw HttpErrors with original message
+        }
+        throw httpErrors.internalServerError('Failed to quote position');
       }
     },
   );

@@ -1,16 +1,15 @@
 import { BigNumber } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
-import { waitForTransactionWithTimeout } from '../../../chains/ethereum/ethereum.utils';
 import { ExecuteQuoteRequestType, SwapExecuteResponseType, SwapExecuteResponse } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { quoteCache } from '../../../services/quote-cache';
 import { ZeroX } from '../0x';
 import { ZeroXExecuteQuoteRequest } from '../schemas';
 
 async function executeQuote(
-  fastify: FastifyInstance,
   walletAddress: string,
   network: string,
   quoteId: string,
@@ -20,7 +19,7 @@ async function executeQuote(
   // Retrieve cached quote from global cache
   const quote = quoteCache.get(quoteId);
   if (!quote) {
-    throw fastify.httpErrors.badRequest('Quote not found or expired');
+    throw httpErrors.badRequest('Quote not found or expired');
   }
 
   const ethereum = await Ethereum.getInstance(network);
@@ -31,9 +30,9 @@ async function executeQuote(
 
   // Check allowance for the sell token
   if (quote.sellTokenAddress !== ethereum.nativeTokenSymbol) {
-    const sellTokenInfo = ethereum.getToken(quote.sellTokenAddress);
+    const sellTokenInfo = await ethereum.getToken(quote.sellTokenAddress);
     if (!sellTokenInfo) {
-      throw fastify.httpErrors.badRequest(`Token ${quote.sellTokenAddress} not found`);
+      throw httpErrors.badRequest(`Token ${quote.sellTokenAddress} not found`);
     }
 
     const tokenContract = ethereum.getContract(quote.sellTokenAddress, wallet);
@@ -46,7 +45,7 @@ async function executeQuote(
 
     const requiredAllowance = BigNumber.from(quote.sellAmount);
     if (BigNumber.from(allowance.value).lt(requiredAllowance)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient allowance for ${sellTokenInfo.symbol}. Required: ${zeroX.formatTokenAmount(quote.sellAmount, sellTokenInfo.decimals)}, Current: ${zeroX.formatTokenAmount(allowance.value.toString(), sellTokenInfo.decimals)}`,
       );
     }
@@ -62,22 +61,22 @@ async function executeQuote(
   };
 
   const txResponse = await wallet.sendTransaction(txData);
-  const txReceipt = await waitForTransactionWithTimeout(txResponse);
+  const txReceipt = await ethereum.handleTransactionExecution(txResponse);
 
   // Get token info for formatting amounts
-  const sellTokenInfo = ethereum.getToken(quote.sellTokenAddress);
-  const buyTokenInfo = ethereum.getToken(quote.buyTokenAddress);
+  const sellTokenInfo = await ethereum.getToken(quote.sellTokenAddress);
+  const buyTokenInfo = await ethereum.getToken(quote.buyTokenAddress);
 
   if (!sellTokenInfo || !buyTokenInfo) {
-    throw fastify.httpErrors.badRequest('Token info not found');
+    throw httpErrors.badRequest('Token info not found');
   }
 
   // Calculate expected amounts from the quote
   const expectedAmountIn = parseFloat(zeroX.formatTokenAmount(quote.sellAmount, sellTokenInfo.decimals));
   const expectedAmountOut = parseFloat(zeroX.formatTokenAmount(quote.buyAmount, buyTokenInfo.decimals));
 
-  // Use the new handleTransactionConfirmation helper
-  const result = ethereum.handleTransactionConfirmation(
+  // Use the new handleExecuteQuoteTransactionConfirmation helper
+  const result = ethereum.handleExecuteQuoteTransactionConfirmation(
     txReceipt,
     quote.sellTokenAddress,
     quote.buyTokenAddress,
@@ -88,7 +87,7 @@ async function executeQuote(
   // Handle different transaction states
   if (result.status === -1) {
     // Transaction failed
-    throw fastify.httpErrors.internalServerError('Transaction failed on-chain');
+    throw httpErrors.internalServerError('Transaction failed on-chain');
   }
 
   if (result.status === 0) {
@@ -129,11 +128,11 @@ export const executeQuoteRoute: FastifyPluginAsync = async (fastify) => {
         const { walletAddress, network, quoteId, gasPrice, maxGas } =
           request.body as typeof ZeroXExecuteQuoteRequest._type;
 
-        return await executeQuote(fastify, walletAddress, network, quoteId, gasPrice, maxGas);
+        return await executeQuote(walletAddress, network, quoteId, gasPrice, maxGas);
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing 0x quote:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

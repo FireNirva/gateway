@@ -1,58 +1,59 @@
 import { Contract } from '@ethersproject/contracts';
 import { Static } from '@sinclair/typebox';
-import { Token, CurrencyAmount, Percent } from '@uniswap/sdk-core';
-import { Position, Pool as V3Pool, NonfungiblePositionManager, FeeAmount } from '@uniswap/v3-sdk';
-import { BigNumber, utils } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { CurrencyAmount, Percent } from '@uniswap/sdk-core';
+import { Position, NonfungiblePositionManager } from '@uniswap/v3-sdk';
+import { BigNumber } from 'ethers';
+import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { AddLiquidityResponseType, AddLiquidityResponse } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { UniswapClmmAddLiquidityRequest } from '../schemas';
 import { Uniswap } from '../uniswap';
-import { getUniswapV3NftManagerAddress, POSITION_MANAGER_ABI, ERC20_ABI } from '../uniswap.contracts';
+import { UniswapConfig } from '../uniswap.config';
+import { getUniswapV3NftManagerAddress, POSITION_MANAGER_ABI } from '../uniswap.contracts';
 import { formatTokenAmount } from '../uniswap.utils';
 
 // Default gas limit for CLMM add liquidity operations
 const CLMM_ADD_LIQUIDITY_GAS_LIMIT = 600000;
 
 export async function addLiquidity(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
   baseTokenAmount: number,
   quoteTokenAmount: number,
-  slippagePct?: number,
+  slippagePct: number = UniswapConfig.config.slippagePct,
 ): Promise<AddLiquidityResponseType> {
   if (!positionAddress || (baseTokenAmount === undefined && quoteTokenAmount === undefined)) {
-    throw fastify.httpErrors.badRequest('Missing required parameters');
+    throw httpErrors.badRequest('Missing required parameters');
   }
 
   const uniswap = await Uniswap.getInstance(network);
   const ethereum = await Ethereum.getInstance(network);
   const wallet = await ethereum.getWallet(walletAddress);
   if (!wallet) {
-    throw fastify.httpErrors.badRequest('Wallet not found');
+    throw httpErrors.badRequest('Wallet not found');
   }
 
   const positionManagerAddress = getUniswapV3NftManagerAddress(network);
   const positionManager = new Contract(positionManagerAddress, POSITION_MANAGER_ABI, ethereum.provider);
   const position = await positionManager.positions(positionAddress);
 
-  const token0 = uniswap.getTokenByAddress(position.token0);
-  const token1 = uniswap.getTokenByAddress(position.token1);
+  const token0 = await uniswap.getToken(position.token0);
+  const token1 = await uniswap.getToken(position.token1);
   const fee = position.fee;
   const tickLower = position.tickLower;
   const tickUpper = position.tickUpper;
 
   const pool = await uniswap.getV3Pool(token0, token1, fee);
   if (!pool) {
-    throw fastify.httpErrors.notFound('Pool not found for position');
+    throw httpErrors.notFound('Pool not found for position');
   }
 
-  const slippageTolerance = new Percent(Math.floor((slippagePct ?? uniswap.config.slippagePct) * 100), 10000);
+  const slippageTolerance = new Percent(Math.floor(slippagePct * 100), 10000);
 
   const baseTokenSymbol = token0.symbol === 'WETH' ? token0.symbol : token1.symbol;
   const isBaseToken0 = token0.symbol === baseTokenSymbol;
@@ -110,7 +111,7 @@ export async function addLiquidity(
     const requiredAmount0 = BigNumber.from(token0Amount.quotient.toString());
 
     if (currentAllowance0.lt(requiredAmount0)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token0.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount0.toString(), token0.decimals)} ${token0.symbol} for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -128,7 +129,7 @@ export async function addLiquidity(
     const requiredAmount1 = BigNumber.from(token1Amount.quotient.toString());
 
     if (currentAllowance1.lt(requiredAmount1)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token1.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount1.toString(), token1.decimals)} ${token1.symbol} for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -151,7 +152,7 @@ export async function addLiquidity(
   const txParams = await ethereum.prepareGasOptions(undefined, CLMM_ADD_LIQUIDITY_GAS_LIMIT);
   txParams.value = BigNumber.from(value.toString());
   const tx = await positionManagerWithSigner.multicall([calldata], txParams);
-  const receipt = await tx.wait();
+  const receipt = await ethereum.handleTransactionExecution(tx);
 
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
   const actualToken0Amount = formatTokenAmount(newPosition.mintAmounts.amount0.toString(), token0.decimals);
@@ -162,7 +163,7 @@ export async function addLiquidity(
 
   return {
     signature: receipt.transactionHash,
-    status: 1,
+    status: receipt.status,
     data: {
       fee: gasFee,
       baseTokenAmountAdded: actualBaseAmount,
@@ -203,12 +204,11 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
           const uniswap = await Uniswap.getInstance(network);
           walletAddress = await uniswap.getFirstWalletAddress();
           if (!walletAddress) {
-            throw fastify.httpErrors.badRequest('No wallet address provided and no default wallet found');
+            throw httpErrors.badRequest('No wallet address provided and no default wallet found');
           }
         }
 
         return await addLiquidity(
-          fastify,
           network,
           walletAddress,
           positionAddress,
@@ -221,7 +221,7 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         if (e.statusCode) {
           throw e;
         }
-        throw fastify.httpErrors.internalServerError('Failed to add liquidity');
+        throw httpErrors.internalServerError('Failed to add liquidity');
       }
     },
   );

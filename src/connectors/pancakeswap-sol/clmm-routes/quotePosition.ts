@@ -1,10 +1,12 @@
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { QuotePositionResponse, QuotePositionResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { PancakeswapSol } from '../pancakeswap-sol';
+import { PancakeswapSolConfig } from '../pancakeswap-sol.config';
 import {
   getLiquidityFromAmounts,
   getLiquidityFromSingleAmount,
@@ -18,13 +20,13 @@ import { PancakeswapSolClmmQuotePositionRequest } from '../schemas';
  * Calculates token amounts needed for a position based on price range and current price
  */
 async function quotePosition(
-  _fastify: FastifyInstance,
   network: string,
   lowerPrice: number,
   upperPrice: number,
   poolAddress: string,
   baseTokenAmount?: number,
   quoteTokenAmount?: number,
+  slippagePct?: number,
 ): Promise<QuotePositionResponseType> {
   const solana = await Solana.getInstance(network);
   const pancakeswapSol = await PancakeswapSol.getInstance(network);
@@ -32,7 +34,7 @@ async function quotePosition(
   // Get pool info to get current price and tick spacing
   const poolInfo = await pancakeswapSol.getClmmPoolInfo(poolAddress);
   if (!poolInfo) {
-    throw _fastify.httpErrors.notFound(`Pool not found: ${poolAddress}`);
+    throw httpErrors.notFound(`Pool not found: ${poolAddress}`);
   }
 
   const currentPrice = poolInfo.price;
@@ -40,7 +42,7 @@ async function quotePosition(
 
   // Validate price range
   if (lowerPrice >= upperPrice) {
-    throw _fastify.httpErrors.badRequest('Lower price must be less than upper price');
+    throw httpErrors.badRequest('Lower price must be less than upper price');
   }
 
   // Get token info for decimals
@@ -48,7 +50,7 @@ async function quotePosition(
   const quoteToken = await solana.getToken(poolInfo.quoteTokenAddress);
 
   if (!baseToken || !quoteToken) {
-    throw _fastify.httpErrors.notFound('Token information not found');
+    throw httpErrors.notFound('Token information not found');
   }
 
   // Calculate decimal difference for tick conversions
@@ -256,7 +258,7 @@ async function quotePosition(
     calculatedBaseAmount = amounts.amount0;
     calculatedQuoteAmount = amounts.amount1;
   } else {
-    throw _fastify.httpErrors.badRequest('Must specify baseTokenAmount or quoteTokenAmount');
+    throw httpErrors.badRequest('Must specify baseTokenAmount or quoteTokenAmount');
   }
 
   logger.info(
@@ -267,13 +269,18 @@ async function quotePosition(
   );
   logger.info(`Liquidity: ${liquidity.toString()}, Base limited: ${baseLimited}`);
 
+  // Apply slippage to calculate max amounts
+  // User amounts are the quoted amounts, max allows for slippage tolerance
+  const effectiveSlippage = slippagePct ?? PancakeswapSolConfig.config.slippagePct;
+  const slippageMultiplier = 1 + effectiveSlippage / 100;
+
   // Return quote with calculated amounts
   return {
     baseLimited,
     baseTokenAmount: calculatedBaseAmount,
     quoteTokenAmount: calculatedQuoteAmount,
-    baseTokenAmountMax: calculatedBaseAmount * 1.01, // 1% buffer for precision
-    quoteTokenAmountMax: calculatedQuoteAmount * 1.01,
+    baseTokenAmountMax: calculatedBaseAmount * slippageMultiplier,
+    quoteTokenAmountMax: calculatedQuoteAmount * slippageMultiplier,
     liquidity: liquidity.toString(),
   };
 }
@@ -305,16 +312,17 @@ export const quotePositionRoute: FastifyPluginAsync = async (fastify) => {
           poolAddress,
           baseTokenAmount,
           quoteTokenAmount,
+          slippagePct,
         } = request.query;
 
         return await quotePosition(
-          fastify,
           network,
           lowerPrice,
           upperPrice,
           poolAddress,
           baseTokenAmount,
           quoteTokenAmount,
+          slippagePct,
         );
       } catch (e: any) {
         logger.error('Quote position error:', e);
@@ -324,7 +332,7 @@ export const quotePositionRoute: FastifyPluginAsync = async (fastify) => {
         }
         // Handle unknown errors
         const errorMessage = e.message || 'Failed to quote position';
-        throw fastify.httpErrors.internalServerError(errorMessage);
+        throw httpErrors.internalServerError(errorMessage);
       }
     },
   );

@@ -5,12 +5,15 @@ import { PublicKey, MemcmpFilter } from '@solana/web3.js';
 import { Solana } from '../../chains/solana/solana';
 import { MeteoraPoolInfo, PositionInfo, BinLiquidity } from '../../schemas/clmm-schema';
 import { convertDecimals } from '../../services/base';
+import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
 import { MeteoraConfig } from './meteora.config';
 
 export class Meteora {
   private static _instances: { [name: string]: Meteora };
+  // Recommended maximum bins per position (aligns with SDK's DEFAULT_BIN_PER_POSITION)
+  // Ensures single-transaction operations. SDK supports up to 1400 bins via multiple transactions.
   private static readonly MAX_BINS = 70;
   private solana: Solana;
   public config: MeteoraConfig.RootConfig;
@@ -61,14 +64,22 @@ export class Meteora {
     }
 
     // Create a promise for the DLMM instance
-    const dlmmPoolPromise = DLMM.create(this.solana.connection, new PublicKey(poolAddress), {
-      cluster: this.solana.network as any,
-    }).then(async (dlmmPool) => {
-      await dlmmPool.refetchStates();
-      this.dlmmPools.set(poolAddress, dlmmPool);
-      this.dlmmPoolPromises.delete(poolAddress);
-      return dlmmPool;
-    });
+    const dlmmPoolPromise = (async () => {
+      try {
+        const dlmmPool = await DLMM.create(this.solana.connection, new PublicKey(poolAddress), {
+          cluster: this.solana.network as any,
+        });
+        await dlmmPool.refetchStates();
+        this.dlmmPools.set(poolAddress, dlmmPool);
+        this.dlmmPoolPromises.delete(poolAddress);
+        return dlmmPool;
+      } catch (error) {
+        this.dlmmPoolPromises.delete(poolAddress);
+        logger.error(`Failed to get DLMM pool ${poolAddress}: ${error.message}`);
+        // Pass along the original error message for better debugging
+        throw httpErrors.badRequest(`Invalid pool address: ${error.message}`);
+      }
+    })();
 
     this.dlmmPoolPromises.set(poolAddress, dlmmPoolPromise);
     return dlmmPoolPromise;
@@ -163,7 +174,7 @@ export class Meteora {
         bins: await this.getPoolLiquidity(poolAddress),
       };
     } catch (error) {
-      logger.error(`Error getting pool info for ${poolAddress}:`, error);
+      logger.debug(`Could not decode ${poolAddress} as Meteora pool: ${error}`);
       return null;
     }
   }
@@ -178,8 +189,8 @@ export class Meteora {
     return binData.bins.map((bin) => ({
       binId: bin.binId,
       price: Number(bin.pricePerToken),
-      baseTokenAmount: Number(convertDecimals(bin.xAmount, dlmmPool.tokenX.decimal)),
-      quoteTokenAmount: Number(convertDecimals(bin.yAmount, dlmmPool.tokenY.decimal)),
+      baseTokenAmount: Number(convertDecimals(bin.xAmount, dlmmPool.tokenX.mint.decimals)),
+      quoteTokenAmount: Number(convertDecimals(bin.yAmount, dlmmPool.tokenY.mint.decimals)),
     }));
   }
 
@@ -220,7 +231,7 @@ export class Meteora {
           continue;
         }
 
-        const decimalDiff = dlmmPool.tokenX.decimal - dlmmPool.tokenY.decimal;
+        const decimalDiff = dlmmPool.tokenX.mint.decimals - dlmmPool.tokenY.mint.decimals;
         const adjustmentFactor = Math.pow(10, decimalDiff);
 
         let posIndex = 0;
@@ -245,15 +256,23 @@ export class Meteora {
             const adjustedUpperPrice = Number(upperPrice) * adjustmentFactor;
 
             logger.debug(`Getting token amounts for position ${publicKey.toString()}`);
-            const baseTokenAmount = Number(convertDecimals(positionData.totalXAmount, dlmmPool.tokenX.decimal));
-            const quoteTokenAmount = Number(convertDecimals(positionData.totalYAmount, dlmmPool.tokenY.decimal));
+            const baseTokenAmount = Number(convertDecimals(positionData.totalXAmount, dlmmPool.tokenX.mint.decimals));
+            const quoteTokenAmount = Number(convertDecimals(positionData.totalYAmount, dlmmPool.tokenY.mint.decimals));
 
-            // NOTE: Fee calculation is skipped for batch position fetching because
-            // the positionData.feeX/feeY getters require internal state that may not be initialized
-            // when fetched via getAllLbPairPositionsByUser. Fees are set to 0.
-            // For accurate fee data, use getPositionInfo() for individual positions.
-            const baseFeeAmount = 0;
-            const quoteFeeAmount = 0;
+            // Fetch position directly from pool to get accurate fee data
+            let baseFeeAmount = 0;
+            let quoteFeeAmount = 0;
+            try {
+              const position = await dlmmPool.getPosition(publicKey);
+              if (position && position.positionData) {
+                baseFeeAmount = Number(convertDecimals(position.positionData.feeX, dlmmPool.tokenX.mint.decimals));
+                quoteFeeAmount = Number(convertDecimals(position.positionData.feeY, dlmmPool.tokenY.mint.decimals));
+              }
+            } catch (feeError) {
+              logger.warn(
+                `Could not calculate fees for position ${publicKey.toString()}, setting to 0: ${feeError.message}`,
+              );
+            }
 
             logger.debug(`Creating position info object for ${publicKey.toString()}`);
             positions.push({
@@ -312,26 +331,48 @@ export class Meteora {
     return matchingPosition;
   }
 
-  /** Gets position information */
-  async getPositionInfo(positionAddress: string, wallet: PublicKey): Promise<PositionInfo> {
-    const { position, info } = await this.getRawPosition(positionAddress, wallet);
-    if (!position) {
-      throw new Error('Position not found');
+  /** Gets position information directly by position address (without needing wallet) */
+  async getPositionInfoByAddress(positionAddress: string): Promise<PositionInfo> {
+    // Validate position address
+    let positionPubkey: PublicKey;
+    try {
+      positionPubkey = new PublicKey(positionAddress);
+    } catch {
+      throw httpErrors.badRequest(`Invalid position address: ${positionAddress}`);
     }
 
-    const dlmmPool = await this.getDlmmPool(info.publicKey.toBase58());
+    // Fetch the position account to extract pool address
+    const positionAccount = await this.solana.connection.getAccountInfo(positionPubkey);
+
+    if (!positionAccount) {
+      throw httpErrors.notFound(`Position not found or closed: ${positionAddress}`);
+    }
+
+    // Parse the position account to extract the pool address (lbPair)
+    // Meteora position account structure: lbPair is at offset 8-40 (after discriminator)
+    const lbPairPubkey = new PublicKey(positionAccount.data.slice(8, 40));
+    const poolAddress = lbPairPubkey.toBase58();
+
+    // Get the pool and position using SDK methods
+    const dlmmPool = await this.getDlmmPool(poolAddress);
+    const position = await dlmmPool.getPosition(positionPubkey);
+
+    if (!position) {
+      throw httpErrors.notFound(`Position not found or closed: ${positionAddress}`);
+    }
+
     const activeBin = await dlmmPool.getActiveBin();
 
     if (!activeBin || !activeBin.price || !activeBin.pricePerToken) {
-      throw new Error(`Invalid active bin data for pool: ${info.publicKey.toBase58()}`);
+      throw httpErrors.badRequest(`Invalid active bin data for pool: ${poolAddress}`);
     }
 
     // Get prices from bin IDs
     const lowerPrice = getPriceOfBinByBinId(position.positionData.lowerBinId, dlmmPool.lbPair.binStep);
     const upperPrice = getPriceOfBinByBinId(position.positionData.upperBinId, dlmmPool.lbPair.binStep);
 
-    // Adjust for decimal difference (tokenX.decimal - tokenY.decimal)
-    const decimalDiff = dlmmPool.tokenX.decimal - dlmmPool.tokenY.decimal;
+    // Adjust for decimal difference (tokenX.mint.decimals - tokenY.mint.decimals)
+    const decimalDiff = dlmmPool.tokenX.mint.decimals - dlmmPool.tokenY.mint.decimals;
     const adjustmentFactor = Math.pow(10, decimalDiff);
 
     const adjustedLowerPrice = Number(lowerPrice) * adjustmentFactor;
@@ -341,8 +382,60 @@ export class Meteora {
     let baseFeeAmount = 0;
     let quoteFeeAmount = 0;
     try {
-      baseFeeAmount = Number(convertDecimals(position.positionData.feeX, dlmmPool.tokenX.decimal));
-      quoteFeeAmount = Number(convertDecimals(position.positionData.feeY, dlmmPool.tokenY.decimal));
+      baseFeeAmount = Number(convertDecimals(position.positionData.feeX, dlmmPool.tokenX.mint.decimals));
+      quoteFeeAmount = Number(convertDecimals(position.positionData.feeY, dlmmPool.tokenY.mint.decimals));
+    } catch (feeError) {
+      logger.warn(`Could not calculate fees for position ${positionAddress}, setting to 0: ${feeError.message}`);
+    }
+
+    return {
+      address: positionAddress,
+      poolAddress: poolAddress,
+      baseTokenAddress: dlmmPool.tokenX.publicKey.toBase58(),
+      quoteTokenAddress: dlmmPool.tokenY.publicKey.toBase58(),
+      baseTokenAmount: Number(convertDecimals(position.positionData.totalXAmount, dlmmPool.tokenX.mint.decimals)),
+      quoteTokenAmount: Number(convertDecimals(position.positionData.totalYAmount, dlmmPool.tokenY.mint.decimals)),
+      baseFeeAmount,
+      quoteFeeAmount,
+      lowerBinId: position.positionData.lowerBinId,
+      upperBinId: position.positionData.upperBinId,
+      lowerPrice: adjustedLowerPrice,
+      upperPrice: adjustedUpperPrice,
+      price: Number(activeBin.pricePerToken),
+    };
+  }
+
+  /** Gets position information (legacy method using wallet) */
+  async getPositionInfo(positionAddress: string, wallet: PublicKey): Promise<PositionInfo> {
+    const { position, info } = await this.getRawPosition(positionAddress, wallet);
+    if (!position) {
+      throw httpErrors.notFound(`Position not found or closed: ${positionAddress}`);
+    }
+
+    const dlmmPool = await this.getDlmmPool(info.publicKey.toBase58());
+    const activeBin = await dlmmPool.getActiveBin();
+
+    if (!activeBin || !activeBin.price || !activeBin.pricePerToken) {
+      throw httpErrors.badRequest(`Invalid active bin data for pool: ${info.publicKey.toBase58()}`);
+    }
+
+    // Get prices from bin IDs
+    const lowerPrice = getPriceOfBinByBinId(position.positionData.lowerBinId, dlmmPool.lbPair.binStep);
+    const upperPrice = getPriceOfBinByBinId(position.positionData.upperBinId, dlmmPool.lbPair.binStep);
+
+    // Adjust for decimal difference (tokenX.mint.decimals - tokenY.mint.decimals)
+    const decimalDiff = dlmmPool.tokenX.mint.decimals - dlmmPool.tokenY.mint.decimals;
+    const adjustmentFactor = Math.pow(10, decimalDiff);
+
+    const adjustedLowerPrice = Number(lowerPrice) * adjustmentFactor;
+    const adjustedUpperPrice = Number(upperPrice) * adjustmentFactor;
+
+    // Try to get fees - may fail if internal state isn't initialized
+    let baseFeeAmount = 0;
+    let quoteFeeAmount = 0;
+    try {
+      baseFeeAmount = Number(convertDecimals(position.positionData.feeX, dlmmPool.tokenX.mint.decimals));
+      quoteFeeAmount = Number(convertDecimals(position.positionData.feeY, dlmmPool.tokenY.mint.decimals));
     } catch (feeError) {
       logger.warn(`Could not calculate fees for position ${positionAddress}, setting to 0: ${feeError.message}`);
     }
@@ -352,8 +445,8 @@ export class Meteora {
       poolAddress: info.publicKey.toString(),
       baseTokenAddress: dlmmPool.tokenX.publicKey.toBase58(),
       quoteTokenAddress: dlmmPool.tokenY.publicKey.toBase58(),
-      baseTokenAmount: Number(convertDecimals(position.positionData.totalXAmount, dlmmPool.tokenX.decimal)),
-      quoteTokenAmount: Number(convertDecimals(position.positionData.totalYAmount, dlmmPool.tokenY.decimal)),
+      baseTokenAmount: Number(convertDecimals(position.positionData.totalXAmount, dlmmPool.tokenX.mint.decimals)),
+      quoteTokenAmount: Number(convertDecimals(position.positionData.totalYAmount, dlmmPool.tokenY.mint.decimals)),
       baseFeeAmount,
       quoteFeeAmount,
       lowerBinId: position.positionData.lowerBinId,
@@ -390,7 +483,11 @@ export class Meteora {
     const maxBinId = dlmmPool.getBinIdFromPrice(Number(upperPricePerLamport), false) + padBins;
 
     if (maxBinId - minBinId > Meteora.MAX_BINS) {
-      throw new Error(`Position range too wide. Maximum ${Meteora.MAX_BINS} bins allowed`);
+      throw new Error(
+        `Position range too wide: ${maxBinId - minBinId} bins requested. ` +
+          `Recommended maximum is ${Meteora.MAX_BINS} bins for single-transaction operations. ` +
+          `For wider ranges, create multiple positions or narrow your price range.`,
+      );
     }
 
     return { minBinId, maxBinId };

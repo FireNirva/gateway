@@ -1,5 +1,5 @@
 import { Type, Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 // Solana connector imports
 import { getEthereumChainConfig, getEthereumNetworkConfig } from '../../chains/ethereum/ethereum.config';
@@ -7,6 +7,7 @@ import { getSolanaChainConfig, getSolanaNetworkConfig } from '../../chains/solan
 import { executeSwap as zeroXRouterExecuteSwap } from '../../connectors/0x/router-routes/executeSwap';
 import { executeSwap as jupiterRouterExecuteSwap } from '../../connectors/jupiter/router-routes/executeSwap';
 import { executeSwap as meteoraClmmExecuteSwap } from '../../connectors/meteora/clmm-routes/executeSwap';
+import { executeSwap as orcaClmmExecuteSwap } from '../../connectors/orca/clmm-routes/executeSwap';
 import { executeSwap as pancakeswapAmmExecuteSwap } from '../../connectors/pancakeswap/amm-routes/executeSwap';
 import { executeSwap as pancakeswapClmmExecuteSwap } from '../../connectors/pancakeswap/clmm-routes/executeSwap';
 import { executeSwap as pancakeswapRouterExecuteSwap } from '../../connectors/pancakeswap/router-routes/executeSwap';
@@ -21,6 +22,7 @@ import { executeSwap as uniswapRouterExecuteSwap } from '../../connectors/uniswa
 
 // Config and utilities
 import { ChainExecuteSwapResponseSchema } from '../../schemas/chain-schema';
+import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 import { PoolService } from '../../services/pool-service';
 
@@ -110,7 +112,6 @@ function parseChainNetwork(chainNetwork: string): { chain: string; network: stri
  * Execute a Solana swap
  */
 async function executeSolanaSwap(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   baseToken: string,
@@ -138,7 +139,7 @@ async function executeSolanaSwap(
       const pool = await poolService.getPool(connectorName, network, connectorType, baseToken, quoteToken);
 
       if (!pool) {
-        throw fastify.httpErrors.notFound(
+        throw httpErrors.notFound(
           `No ${connectorType.toUpperCase()} pool found for ${baseToken}-${quoteToken} on ${connectorName}/${network}`,
         );
       }
@@ -152,20 +153,18 @@ async function executeSolanaSwap(
 
     if (providerKey === 'jupiter/router') {
       return await jupiterRouterExecuteSwap(
-        fastify,
         walletAddress,
         network,
         baseToken,
         quoteToken,
         amount,
         side,
-        slippagePct || 1,
+        slippagePct,
         undefined, // priorityLevel
         undefined, // maxLamports
       );
     } else if (providerKey === 'raydium/amm') {
       return await raydiumAmmExecuteSwap(
-        fastify,
         network,
         walletAddress,
         baseToken,
@@ -173,11 +172,10 @@ async function executeSolanaSwap(
         amount,
         side,
         poolAddress!,
-        slippagePct || 1,
+        slippagePct,
       );
     } else if (providerKey === 'raydium/clmm') {
       return await raydiumClmmExecuteSwap(
-        fastify,
         network,
         walletAddress,
         baseToken,
@@ -185,11 +183,10 @@ async function executeSolanaSwap(
         amount,
         side,
         poolAddress!,
-        slippagePct || 1,
+        slippagePct,
       );
     } else if (providerKey === 'meteora/clmm') {
       return await meteoraClmmExecuteSwap(
-        fastify,
         network,
         walletAddress,
         baseToken,
@@ -197,11 +194,10 @@ async function executeSolanaSwap(
         amount,
         side,
         poolAddress!,
-        slippagePct || 1,
+        slippagePct,
       );
     } else if (providerKey === 'pancakeswap-sol/clmm') {
       return await pancakeswapSolClmmExecuteSwap(
-        fastify,
         network,
         walletAddress,
         baseToken,
@@ -209,17 +205,28 @@ async function executeSolanaSwap(
         amount,
         side,
         poolAddress,
-        slippagePct || 1,
+        slippagePct,
+      );
+    } else if (providerKey === 'orca/clmm') {
+      return await orcaClmmExecuteSwap(
+        network,
+        walletAddress,
+        baseToken,
+        quoteToken,
+        amount,
+        side,
+        poolAddress!,
+        slippagePct,
       );
     }
 
-    throw fastify.httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
+    throw httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
   } catch (error) {
     logger.error(`Error executing swap: ${error.message}`);
     if (error.statusCode) {
       throw error;
     }
-    throw fastify.httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
   }
 }
 
@@ -227,7 +234,6 @@ async function executeSolanaSwap(
  * Execute an Ethereum swap
  */
 async function executeEthereumSwap(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   baseToken: string,
@@ -255,7 +261,7 @@ async function executeEthereumSwap(
       const pool = await poolService.getPool(connectorName, network, connectorType, baseToken, quoteToken);
 
       if (!pool) {
-        throw fastify.httpErrors.notFound(
+        throw httpErrors.notFound(
           `No ${connectorType.toUpperCase()} pool found for ${baseToken}-${quoteToken} on ${connectorName}/${network}`,
         );
       }
@@ -265,95 +271,39 @@ async function executeEthereumSwap(
     }
 
     // Route to the appropriate connector based on swapProvider
-    // All Ethereum connectors have signature: (fastify, walletAddress, network, baseToken, quoteToken, amount, side, slippagePct)
     const providerKey = swapProvider;
 
     if (providerKey === 'uniswap/router') {
-      return await uniswapRouterExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await uniswapRouterExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'uniswap/amm') {
-      return await uniswapAmmExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await uniswapAmmExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'uniswap/clmm') {
-      return await uniswapClmmExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await uniswapClmmExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap/router') {
       return await pancakeswapRouterExecuteSwap(
-        fastify,
         walletAddress,
         network,
         baseToken,
         quoteToken,
         amount,
         side,
-        slippagePct || 1,
+        slippagePct,
       );
     } else if (providerKey === 'pancakeswap/amm') {
-      return await pancakeswapAmmExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await pancakeswapAmmExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap/clmm') {
-      return await pancakeswapClmmExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await pancakeswapClmmExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === '0x/router') {
-      return await zeroXRouterExecuteSwap(
-        fastify,
-        walletAddress,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await zeroXRouterExecuteSwap(walletAddress, network, baseToken, quoteToken, amount, side, slippagePct);
     }
 
-    throw fastify.httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
+    throw httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
   } catch (error) {
     logger.error(`Error executing swap: ${error.message}`);
     if (error.statusCode) {
       throw error;
     }
-    throw fastify.httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
   }
 }
 
@@ -361,7 +311,6 @@ async function executeEthereumSwap(
  * Execute a swap across any supported chain
  */
 export async function executeUnifiedSwap(
-  fastify: FastifyInstance,
   chainNetwork: string,
   walletAddress: string,
   baseToken: string,
@@ -379,33 +328,13 @@ export async function executeUnifiedSwap(
 
   switch (chain.toLowerCase()) {
     case 'ethereum':
-      return executeEthereumSwap(
-        fastify,
-        network,
-        walletAddress,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct,
-        connector,
-      );
+      return executeEthereumSwap(network, walletAddress, baseToken, quoteToken, amount, side, slippagePct, connector);
 
     case 'solana':
-      return executeSolanaSwap(
-        fastify,
-        network,
-        walletAddress,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct,
-        connector,
-      );
+      return executeSolanaSwap(network, walletAddress, baseToken, quoteToken, amount, side, slippagePct, connector);
 
     default:
-      throw fastify.httpErrors.badRequest(`Unsupported chain: ${chain}`);
+      throw httpErrors.badRequest(`Unsupported chain: ${chain}`);
   }
 }
 
@@ -432,7 +361,6 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
 
       try {
         const result = await executeUnifiedSwap(
-          fastify,
           chainNetwork,
           walletAddress,
           baseToken,
@@ -445,7 +373,10 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
         return reply.code(200).send(result);
       } catch (error: any) {
         logger.error(`[UnifiedSwap] Execute error: ${error.message}`);
-        throw error;
+        if (error.statusCode) {
+          throw error;
+        }
+        throw fastify.httpErrors.internalServerError(error.message || 'Failed to execute swap');
       }
     },
   );

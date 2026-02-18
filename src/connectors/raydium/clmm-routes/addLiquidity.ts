@@ -1,26 +1,26 @@
-import { PoolUtils, TxVersion } from '@raydium-io/raydium-sdk-v2';
+import { TxVersion } from '@raydium-io/raydium-sdk-v2';
 import { Static } from '@sinclair/typebox';
 import { VersionedTransaction } from '@solana/web3.js';
 import BN from 'bn.js';
-import Decimal from 'decimal.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
-import { AddLiquidityResponse, AddLiquidityRequestType, AddLiquidityResponseType } from '../../../schemas/clmm-schema';
+import { AddLiquidityResponse, AddLiquidityResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Raydium } from '../raydium';
+import { RaydiumConfig } from '../raydium.config';
 import { RaydiumClmmAddLiquidityRequest } from '../schemas';
 
 import { quotePosition } from './quotePosition';
 
 export async function addLiquidity(
-  _fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
   baseTokenAmount: number,
   quoteTokenAmount: number,
-  slippagePct?: number,
+  slippagePct: number = RaydiumConfig.config.slippagePct,
 ): Promise<AddLiquidityResponseType> {
   const solana = await Solana.getInstance(network);
   const raydium = await Raydium.getInstance(network);
@@ -39,7 +39,6 @@ export async function addLiquidity(
   const quoteToken = await solana.getToken(poolInfo.mintB.address);
 
   const quotePositionResponse = await quotePosition(
-    _fastify,
     network,
     positionInfo.lowerPrice,
     positionInfo.upperPrice,
@@ -84,7 +83,7 @@ export async function addLiquidity(
     isHardwareWallet,
     wallet,
   )) as VersionedTransaction;
-  await solana.simulateWithErrorHandling(transaction, _fastify);
+  await solana.simulateWithErrorHandling(transaction);
 
   const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction);
 
@@ -93,19 +92,21 @@ export async function addLiquidity(
 
     // Handle balance changes - need to be careful when SOL is one of the tokens
     const tokenAddresses = [];
-    const isBaseSol = baseToken.symbol === 'SOL' || baseToken.address === 'So11111111111111111111111111111111111111112';
+    const baseTokenAddress = baseToken?.address || poolInfo.mintA.address;
+    const quoteTokenAddress = quoteToken?.address || poolInfo.mintB.address;
+    const isBaseSol = baseToken?.symbol === 'SOL' || baseTokenAddress === 'So11111111111111111111111111111111111111112';
     const isQuoteSol =
-      quoteToken.symbol === 'SOL' || quoteToken.address === 'So11111111111111111111111111111111111111112';
+      quoteToken?.symbol === 'SOL' || quoteTokenAddress === 'So11111111111111111111111111111111111111112';
 
     // Always get SOL balance change first
     tokenAddresses.push('So11111111111111111111111111111111111111112');
 
     // Add non-SOL tokens
     if (!isBaseSol) {
-      tokenAddresses.push(baseToken.address);
+      tokenAddresses.push(baseTokenAddress);
     }
     if (!isQuoteSol) {
-      tokenAddresses.push(quoteToken.address);
+      tokenAddresses.push(quoteTokenAddress);
     }
 
     const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, walletAddress, tokenAddresses);
@@ -158,7 +159,6 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
           request.body;
 
         return await addLiquidity(
-          fastify,
           network,
           walletAddress,
           positionAddress,
@@ -168,7 +168,8 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         );
       } catch (e) {
         logger.error(e);
-        throw fastify.httpErrors.internalServerError('Internal server error');
+        if (e.statusCode) throw e;
+        throw httpErrors.internalServerError('Internal server error');
       }
     },
   );

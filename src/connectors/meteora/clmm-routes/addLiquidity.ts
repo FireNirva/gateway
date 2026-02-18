@@ -4,10 +4,11 @@ import { Static } from '@sinclair/typebox';
 import { PublicKey } from '@solana/web3.js';
 import { BN } from 'bn.js';
 import { Decimal } from 'decimal.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { AddLiquidityResponse, AddLiquidityResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraConfig } from '../meteora.config';
@@ -24,21 +25,24 @@ const INSUFFICIENT_BALANCE_MESSAGE = (token: string, required: string, actual: s
 const SOL_TRANSACTION_BUFFER = 0.01; // SOL buffer for transaction costs
 
 export async function addLiquidity(
-  fastify: FastifyInstance,
   network: string,
   address: string,
   positionAddress: string,
   baseTokenAmount: number,
   quoteTokenAmount: number,
-  slippagePct?: number,
+  slippagePct: number = MeteoraConfig.config.slippagePct,
   strategyType?: StrategyType,
 ): Promise<AddLiquidityResponseType> {
   // Validate addresses first
   try {
     new PublicKey(positionAddress);
+  } catch {
+    throw httpErrors.badRequest(`Invalid position address: ${positionAddress}`);
+  }
+  try {
     new PublicKey(address);
-  } catch (error) {
-    throw fastify.httpErrors.badRequest(INVALID_SOLANA_ADDRESS_MESSAGE(positionAddress));
+  } catch {
+    throw httpErrors.badRequest(`Invalid wallet address: ${address}`);
   }
 
   const solana = await Solana.getInstance(network);
@@ -47,23 +51,21 @@ export async function addLiquidity(
 
   // Validate amounts
   if (baseTokenAmount <= 0 && quoteTokenAmount <= 0) {
-    throw fastify.httpErrors.badRequest(MISSING_AMOUNTS_MESSAGE);
+    throw httpErrors.badRequest(MISSING_AMOUNTS_MESSAGE);
   }
 
   // Get position - handle null return gracefully
   const positionResult = await meteora.getRawPosition(positionAddress, wallet.publicKey);
 
   if (!positionResult || !positionResult.position) {
-    throw fastify.httpErrors.notFound(
-      `Position not found: ${positionAddress}. Please provide a valid position address`,
-    );
+    throw httpErrors.notFound(`Position not found: ${positionAddress}. Please provide a valid position address`);
   }
 
   const { position, info } = positionResult;
 
   const dlmmPool = await meteora.getDlmmPool(info.publicKey.toBase58());
   if (!dlmmPool) {
-    throw fastify.httpErrors.notFound(`Pool not found for position: ${positionAddress}`);
+    throw httpErrors.notFound(`Pool not found for position: ${positionAddress}`);
   }
 
   const tokenX = await solana.getToken(dlmmPool.tokenX.publicKey.toBase58());
@@ -77,13 +79,13 @@ export async function addLiquidity(
   const requiredQuote = quoteTokenAmount + (tokenYSymbol === 'SOL' ? SOL_TRANSACTION_BUFFER : 0);
 
   if (balances[tokenXSymbol] < requiredBase) {
-    throw fastify.httpErrors.badRequest(
+    throw httpErrors.badRequest(
       INSUFFICIENT_BALANCE_MESSAGE(tokenXSymbol, requiredBase.toString(), balances[tokenXSymbol].toString()),
     );
   }
 
   if (balances[tokenYSymbol] < requiredQuote) {
-    throw fastify.httpErrors.badRequest(
+    throw httpErrors.badRequest(
       INSUFFICIENT_BALANCE_MESSAGE(tokenYSymbol, requiredQuote.toString(), balances[tokenYSymbol].toString()),
     );
   }
@@ -94,8 +96,8 @@ export async function addLiquidity(
   const maxBinId = position.positionData.upperBinId;
   const minBinId = position.positionData.lowerBinId;
 
-  const totalXAmount = new BN(DecimalUtil.toBN(new Decimal(baseTokenAmount), dlmmPool.tokenX.decimal));
-  const totalYAmount = new BN(DecimalUtil.toBN(new Decimal(quoteTokenAmount), dlmmPool.tokenY.decimal));
+  const totalXAmount = new BN(DecimalUtil.toBN(new Decimal(baseTokenAmount), dlmmPool.tokenX.mint.decimals));
+  const totalYAmount = new BN(DecimalUtil.toBN(new Decimal(quoteTokenAmount), dlmmPool.tokenY.mint.decimals));
 
   const addLiquidityTx = await dlmmPool.addLiquidityByStrategy({
     positionPubKey: new PublicKey(position.publicKey),
@@ -107,14 +109,14 @@ export async function addLiquidity(
       minBinId,
       strategyType: strategyType ?? MeteoraConfig.config.strategyType,
     },
-    slippage: slippagePct ?? MeteoraConfig.config.slippagePct,
+    slippage: slippagePct,
   });
 
   // Set the fee payer for simulation
   addLiquidityTx.feePayer = wallet.publicKey;
 
   // Simulate with error handling
-  await solana.simulateWithErrorHandling(addLiquidityTx, fastify);
+  await solana.simulateWithErrorHandling(addLiquidityTx);
 
   logger.info('Transaction simulated successfully, sending to network...');
 
@@ -185,7 +187,6 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         const network = request.body.network;
 
         return await addLiquidity(
-          fastify,
           network,
           walletAddress,
           positionAddress,
@@ -197,9 +198,9 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {
-          throw fastify.httpErrors.createError(e.statusCode, 'Request failed');
+          throw e; // Re-throw HttpErrors with original message
         }
-        throw fastify.httpErrors.internalServerError('Internal server error');
+        throw httpErrors.internalServerError('Internal server error');
       }
     },
   );

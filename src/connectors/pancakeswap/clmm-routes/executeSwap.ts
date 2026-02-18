@@ -1,12 +1,14 @@
+import { encodeSqrtRatioX96 } from '@uniswap/v3-sdk';
 import { BigNumber, Contract, utils } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { EthereumLedger } from '../../../chains/ethereum/ethereum-ledger';
-import { waitForTransactionWithTimeout } from '../../../chains/ethereum/ethereum.utils';
 import { ExecuteSwapRequestType, SwapExecuteResponseType, SwapExecuteResponse } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Pancakeswap } from '../pancakeswap';
+import { PancakeswapConfig } from '../pancakeswap.config';
 import { getPancakeswapV3SwapRouter02Address, ISwapRouter02ABI } from '../pancakeswap.contracts';
 import { formatTokenAmount } from '../pancakeswap.utils';
 import { PancakeswapExecuteSwapRequest } from '../schemas';
@@ -17,14 +19,13 @@ import { getPancakeswapClmmQuote } from './quoteSwap';
 const CLMM_SWAP_GAS_LIMIT = 350000;
 
 export async function executeClmmSwap(
-  fastify: FastifyInstance,
   walletAddress: string,
   network: string,
   baseToken: string,
   quoteToken: string,
   amount: number,
   side: 'BUY' | 'SELL',
-  slippagePct: number,
+  slippagePct: number = PancakeswapConfig.config.slippagePct,
 ): Promise<SwapExecuteResponseType> {
   const ethereum = await Ethereum.getInstance(network);
   await ethereum.init();
@@ -34,12 +35,11 @@ export async function executeClmmSwap(
   // Find pool address
   const poolAddress = await pancakeswap.findDefaultPool(baseToken, quoteToken, 'clmm');
   if (!poolAddress) {
-    throw fastify.httpErrors.notFound(`No CLMM pool found for pair ${baseToken}-${quoteToken}`);
+    throw httpErrors.notFound(`No CLMM pool found for pair ${baseToken}-${quoteToken}`);
   }
 
   // Get quote using the shared quote function
   const { quote } = await getPancakeswapClmmQuote(
-    fastify,
     network,
     poolAddress,
     baseToken,
@@ -81,8 +81,14 @@ export async function executeClmmSwap(
   // Check if allowance is sufficient
   if (currentAllowance.lt(amountNeeded)) {
     logger.error(`Insufficient allowance for ${quote.inputToken.symbol}`);
-    throw fastify.httpErrors.badRequest(
-      `Insufficient allowance for ${quote.inputToken.symbol}. Please approve at least ${formatTokenAmount(amountNeeded, quote.inputToken.decimals)} ${quote.inputToken.symbol} (${quote.inputToken.address}) for the Pancakeswap SwapRouter02 (${routerAddress})`,
+    const requiredFormatted = formatTokenAmount(amountNeeded, quote.inputToken.decimals);
+    const currentFormatted = formatTokenAmount(currentAllowance.toString(), quote.inputToken.decimals);
+    throw httpErrors.badRequest(
+      `Insufficient allowance for ${quote.inputToken.symbol}. ` +
+        `Current: ${currentFormatted} ${quote.inputToken.symbol}, Required: ${requiredFormatted} ${quote.inputToken.symbol}. ` +
+        `To swap with PancakeSwap CLMM, you need to approve the spender "pancakeswap/clmm/swap" instead of "pancakeswap/clmm". ` +
+        `This will approve the SwapRouter02 address (${routerAddress}), which is used for routing swaps to CLMM pools. ` +
+        `The "pancakeswap/clmm" spender is only for adding liquidity to pools.`,
     );
   }
 
@@ -100,7 +106,10 @@ export async function executeClmmSwap(
     amountOut: 0,
     amountInMaximum: 0,
     amountOutMinimum: 0,
-    sqrtPriceLimitX96: 0,
+    sqrtPriceLimitX96: encodeSqrtRatioX96(
+      quote.trade.executionPrice.numerator,
+      quote.trade.executionPrice.denominator,
+    ).toString(),
   };
 
   let receipt;
@@ -179,8 +188,8 @@ export async function executeClmmSwap(
 
       logger.info(`Transaction sent: ${txResponse.hash}`);
 
-      // Wait for confirmation with timeout (30 seconds for hardware wallets)
-      receipt = await waitForTransactionWithTimeout(txResponse, 30000);
+      // Wait for confirmation with timeout
+      receipt = await ethereum.handleTransactionExecution(txResponse);
     } else {
       // Regular wallet flow
       let wallet;
@@ -188,7 +197,7 @@ export async function executeClmmSwap(
         wallet = await ethereum.getWallet(walletAddress);
       } catch (err) {
         logger.error(`Failed to load wallet: ${err.message}`);
-        throw fastify.httpErrors.internalServerError(`Failed to load wallet: ${err.message}`);
+        throw httpErrors.internalServerError(`Failed to load wallet: ${err.message}`);
       }
 
       const routerContract = new Contract(routerAddress, ISwapRouter02ABI, wallet);
@@ -243,18 +252,18 @@ export async function executeClmmSwap(
       logger.info(`Transaction sent: ${tx.hash}`);
 
       // Wait for transaction confirmation
-      receipt = await tx.wait();
+      receipt = await ethereum.handleTransactionExecution(tx);
     }
 
     // Check if the transaction was successful
     if (receipt.status === 0) {
       logger.error(`Transaction failed on-chain. Receipt: ${JSON.stringify(receipt)}`);
-      throw fastify.httpErrors.internalServerError(
+      throw httpErrors.internalServerError(
         'Transaction reverted on-chain. This could be due to slippage, insufficient funds, or other blockchain issues.',
       );
     }
 
-    logger.info(`Transaction confirmed: ${receipt.transactionHash}`);
+    logger.info(`Transaction hash: ${receipt.transactionHash}`);
     logger.info(`Gas used: ${receipt.gasUsed.toString()}`);
 
     // Calculate amounts using quote values
@@ -277,7 +286,7 @@ export async function executeClmmSwap(
 
     return {
       signature: receipt.transactionHash,
-      status: 1, // CONFIRMED
+      status: receipt.status,
       data: {
         tokenIn,
         tokenOut,
@@ -299,15 +308,15 @@ export async function executeClmmSwap(
 
     // Handle specific error cases
     if (error.message && error.message.includes('insufficient funds')) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         'Insufficient funds for transaction. Please ensure you have enough ETH to cover gas costs.',
       );
     } else if (error.message.includes('rejected on Ledger')) {
-      throw fastify.httpErrors.badRequest('Transaction rejected on Ledger device');
+      throw httpErrors.badRequest('Transaction rejected on Ledger device');
     } else if (error.message.includes('Ledger device is locked')) {
-      throw fastify.httpErrors.badRequest(error.message);
+      throw httpErrors.badRequest(error.message);
     } else if (error.message.includes('Wrong app is open')) {
-      throw fastify.httpErrors.badRequest(error.message);
+      throw httpErrors.badRequest(error.message);
     }
 
     // Re-throw if already a fastify error
@@ -315,7 +324,7 @@ export async function executeClmmSwap(
       throw error;
     }
 
-    throw fastify.httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
   }
 }
 
@@ -339,7 +348,6 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           request.body as typeof PancakeswapExecuteSwapRequest._type;
 
         return await executeClmmSwap(
-          fastify,
           walletAddress,
           network,
           baseToken,
@@ -351,7 +359,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing swap:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

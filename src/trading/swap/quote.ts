@@ -1,5 +1,5 @@
 import { Type, Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 // Solana connector imports
 import { getEthereumNetworkConfig } from '../../chains/ethereum/ethereum.config';
@@ -7,6 +7,7 @@ import { getSolanaNetworkConfig } from '../../chains/solana/solana.config';
 import { quoteSwap as zeroXRouterQuoteSwap } from '../../connectors/0x/router-routes/quoteSwap';
 import { quoteSwap as jupiterRouterQuoteSwap } from '../../connectors/jupiter/router-routes/quoteSwap';
 import { quoteSwap as meteoraClmmQuoteSwap } from '../../connectors/meteora/clmm-routes/quoteSwap';
+import { quoteSwap as orcaClmmQuoteSwap } from '../../connectors/orca/clmm-routes/quoteSwap';
 import { quoteSwap as pancakeswapAmmQuoteSwap } from '../../connectors/pancakeswap/amm-routes/quoteSwap';
 import { quoteSwap as pancakeswapClmmQuoteSwap } from '../../connectors/pancakeswap/clmm-routes/quoteSwap';
 import { quoteSwap as pancakeswapRouterQuoteSwap } from '../../connectors/pancakeswap/router-routes/quoteSwap';
@@ -21,6 +22,7 @@ import { quoteSwap as uniswapRouterQuoteSwap } from '../../connectors/uniswap/ro
 
 // Config and utilities
 import { ChainQuoteSwapResponseSchema } from '../../schemas/chain-schema';
+import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 import { PoolService } from '../../services/pool-service';
 
@@ -78,7 +80,7 @@ function parseChainNetwork(chainNetwork: string): { chain: string; network: stri
   const parts = chainNetwork.split('-');
 
   if (parts.length < 2) {
-    throw new Error(
+    throw httpErrors.badRequest(
       `Invalid chain-network format: ${chainNetwork}. Expected format: chain-network (e.g., solana-mainnet-beta, ethereum-mainnet)`,
     );
   }
@@ -96,7 +98,6 @@ function parseChainNetwork(chainNetwork: string): { chain: string; network: stri
  * Get a Solana swap quote
  */
 async function getSolanaQuoteSwap(
-  fastify: FastifyInstance,
   network: string,
   baseToken: string,
   quoteToken: string,
@@ -123,7 +124,7 @@ async function getSolanaQuoteSwap(
       const pool = await poolService.getPool(connectorName, network, connectorType, baseToken, quoteToken);
 
       if (!pool) {
-        throw fastify.httpErrors.notFound(
+        throw httpErrors.notFound(
           `No ${connectorType.toUpperCase()} pool found for ${baseToken}-${quoteToken} on ${connectorName}/${network}`,
         );
       }
@@ -137,69 +138,34 @@ async function getSolanaQuoteSwap(
 
     if (providerKey === 'jupiter/router') {
       return await jupiterRouterQuoteSwap(
-        fastify,
         network,
         baseToken,
         quoteToken,
         amount,
         side,
-        slippagePct || 1,
+        slippagePct,
         undefined, // onlyDirectRoutes
         undefined, // restrictIntermediateTokens
       );
     } else if (providerKey === 'raydium/amm') {
-      return await raydiumAmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await raydiumAmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'raydium/clmm') {
-      return await raydiumClmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await raydiumClmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'meteora/clmm') {
-      return await meteoraClmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await meteoraClmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap-sol/clmm') {
-      return await pancakeswapSolClmmQuoteSwap(
-        fastify,
-        network,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        poolAddress,
-        slippagePct || 1,
-      );
+      return await pancakeswapSolClmmQuoteSwap(network, baseToken, quoteToken, amount, side, poolAddress, slippagePct);
+    } else if (providerKey === 'orca/clmm') {
+      return await orcaClmmQuoteSwap(network, baseToken, quoteToken, amount, side, poolAddress!, slippagePct);
     }
 
-    throw fastify.httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
+    throw httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
   } catch (error) {
     logger.error(`Error getting swap quote: ${error.message}`);
     if (error.statusCode) {
       throw error;
     }
-    throw fastify.httpErrors.internalServerError(`Failed to get swap quote: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to get swap quote: ${error.message}`);
   }
 }
 
@@ -207,7 +173,6 @@ async function getSolanaQuoteSwap(
  * Get an Ethereum swap quote
  */
 async function getEthereumQuoteSwap(
-  fastify: FastifyInstance,
   network: string,
   baseToken: string,
   quoteToken: string,
@@ -234,7 +199,7 @@ async function getEthereumQuoteSwap(
       const pool = await poolService.getPool(connectorName, network, connectorType, baseToken, quoteToken);
 
       if (!pool) {
-        throw fastify.httpErrors.notFound(
+        throw httpErrors.notFound(
           `No ${connectorType.toUpperCase()} pool found for ${baseToken}-${quoteToken} on ${connectorName}/${network}`,
         );
       }
@@ -247,73 +212,28 @@ async function getEthereumQuoteSwap(
     const providerKey = swapProvider;
 
     if (providerKey === 'uniswap/router') {
-      return await uniswapRouterQuoteSwap(fastify, network, '', baseToken, quoteToken, amount, side, slippagePct || 1);
+      return await uniswapRouterQuoteSwap(network, undefined, baseToken, quoteToken, amount, side, slippagePct || 1);
     } else if (providerKey === 'uniswap/amm') {
-      return await uniswapAmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await uniswapAmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'uniswap/clmm') {
-      return await uniswapClmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await uniswapClmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap/router') {
-      return await pancakeswapRouterQuoteSwap(
-        fastify,
-        network,
-        '',
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await pancakeswapRouterQuoteSwap(network, undefined, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap/amm') {
-      return await pancakeswapAmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await pancakeswapAmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === 'pancakeswap/clmm') {
-      return await pancakeswapClmmQuoteSwap(
-        fastify,
-        network,
-        poolAddress!,
-        baseToken,
-        quoteToken,
-        amount,
-        side,
-        slippagePct || 1,
-      );
+      return await pancakeswapClmmQuoteSwap(network, poolAddress!, baseToken, quoteToken, amount, side, slippagePct);
     } else if (providerKey === '0x/router') {
-      return await zeroXRouterQuoteSwap(fastify, network, baseToken, quoteToken, amount, side, slippagePct || 1);
+      return await zeroXRouterQuoteSwap(network, baseToken, quoteToken, amount, side, slippagePct || 1);
     }
 
-    throw fastify.httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
+    throw httpErrors.badRequest(`Unsupported swap provider: ${swapProvider}`);
   } catch (error) {
     logger.error(`Error getting swap quote: ${error.message}`);
     if (error.statusCode) {
       throw error;
     }
-    throw fastify.httpErrors.internalServerError(`Failed to get swap quote: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to get swap quote: ${error.message}`);
   }
 }
 
@@ -321,7 +241,6 @@ async function getEthereumQuoteSwap(
  * Get a swap quote across any supported chain
  */
 export async function getUnifiedQuoteSwap(
-  fastify: FastifyInstance,
   chainNetwork: string,
   baseToken: string,
   quoteToken: string,
@@ -338,13 +257,13 @@ export async function getUnifiedQuoteSwap(
 
   switch (chain.toLowerCase()) {
     case 'ethereum':
-      return getEthereumQuoteSwap(fastify, network, baseToken, quoteToken, amount, side, slippagePct, connector);
+      return getEthereumQuoteSwap(network, baseToken, quoteToken, amount, side, slippagePct, connector);
 
     case 'solana':
-      return getSolanaQuoteSwap(fastify, network, baseToken, quoteToken, amount, side, slippagePct, connector);
+      return getSolanaQuoteSwap(network, baseToken, quoteToken, amount, side, slippagePct, connector);
 
     default:
-      throw fastify.httpErrors.badRequest(`Unsupported chain: ${chain}`);
+      throw httpErrors.badRequest(`Unsupported chain: ${chain}`);
   }
 }
 
@@ -371,7 +290,6 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
 
       try {
         const result = await getUnifiedQuoteSwap(
-          fastify,
           chainNetwork,
           baseToken,
           quoteToken,
@@ -383,7 +301,10 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
         return reply.code(200).send(result);
       } catch (error: any) {
         logger.error(`[UnifiedSwap] Quote error: ${error.message}`);
-        throw error;
+        if (error.statusCode) {
+          throw error;
+        }
+        throw fastify.httpErrors.internalServerError(error.message || 'Failed to get swap quote');
       }
     },
   );

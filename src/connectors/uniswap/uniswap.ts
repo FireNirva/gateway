@@ -12,6 +12,7 @@ import JSBI from 'jsbi';
 import { Ethereum, TokenInfo } from '../../chains/ethereum/ethereum';
 import { logger } from '../../services/logger';
 
+import { AlphaRouterService, AlphaRouterQuoteResult } from './alpha-router';
 import { UniswapConfig } from './uniswap.config';
 import {
   IUniswapV2PairABI,
@@ -48,6 +49,7 @@ export class Uniswap {
   private v3NFTManager: Contract;
   private v3Quoter: Contract;
   private universalRouter: UniversalRouterService;
+  private alphaRouter: AlphaRouterService;
 
   // Network information
   private networkName: string;
@@ -79,18 +81,22 @@ export class Uniswap {
       this.ethereum = await Ethereum.getInstance(this.networkName);
       this.chainId = this.ethereum.chainId;
 
-      // Initialize V2 (AMM) contracts
-      this.v2Factory = new Contract(
-        getUniswapV2FactoryAddress(this.networkName),
-        IUniswapV2FactoryABI.abi,
-        this.ethereum.provider,
-      );
+      try {
+        // Initialize V2 (AMM) contracts
+        this.v2Factory = new Contract(
+          getUniswapV2FactoryAddress(this.networkName),
+          IUniswapV2FactoryABI.abi,
+          this.ethereum.provider,
+        );
 
-      this.v2Router = new Contract(
-        getUniswapV2RouterAddress(this.networkName),
-        IUniswapV2Router02ABI.abi,
-        this.ethereum.provider,
-      );
+        this.v2Router = new Contract(
+          getUniswapV2RouterAddress(this.networkName),
+          IUniswapV2Router02ABI.abi,
+          this.ethereum.provider,
+        );
+      } catch (error) {
+        logger.info(`Uniswap V2 not available for network: ${this.networkName}, skipping intialization`);
+      }
 
       // Initialize V3 (CLMM) contracts
       this.v3Factory = new Contract(
@@ -135,6 +141,14 @@ export class Uniswap {
       // Initialize Universal Router service
       this.universalRouter = new UniversalRouterService(this.ethereum.provider, this.chainId, this.networkName);
 
+      // Initialize AlphaRouter service for split routing
+      try {
+        this.alphaRouter = new AlphaRouterService(this.ethereum.provider, this.networkName);
+        logger.info(`AlphaRouter initialized for network: ${this.networkName}`);
+      } catch (error) {
+        logger.warn(`AlphaRouter not available for network ${this.networkName}: ${error.message}`);
+      }
+
       // Ensure ethereum is initialized
       if (!this.ethereum.ready()) {
         await this.ethereum.init();
@@ -156,22 +170,11 @@ export class Uniswap {
   }
 
   /**
-   * Given a token's address, return the connector's native representation of the token.
+   * Get token by symbol or address from local token list
    */
-  public getTokenByAddress(address: string): Token | null {
-    const tokenInfo = this.ethereum.getToken(address);
-    if (!tokenInfo) return null;
-
-    // Create Uniswap SDK Token instance
-    return new Token(tokenInfo.chainId, tokenInfo.address, tokenInfo.decimals, tokenInfo.symbol, tokenInfo.name);
-  }
-
-  /**
-   * Given a token's symbol, return the connector's native representation of the token.
-   */
-  public getTokenBySymbol(symbol: string): Token | null {
-    // Just use getTokenByAddress since ethereum.getToken handles both symbols and addresses
-    return this.getTokenByAddress(symbol);
+  public async getToken(symbolOrAddress: string): Promise<Token | null> {
+    const tokenInfo = await this.ethereum.getToken(symbolOrAddress);
+    return tokenInfo ? this.getUniswapToken(tokenInfo) : null;
   }
 
   /**
@@ -197,7 +200,7 @@ export class Uniswap {
     outputToken: Token,
     amount: number,
     side: 'BUY' | 'SELL',
-    walletAddress: string,
+    walletAddress?: string,
   ): Promise<any> {
     // Determine input/output based on side
     const exactIn = side === 'SELL';
@@ -215,6 +218,8 @@ export class Uniswap {
     const slippageTolerance = new Percent(Math.floor(this.config.slippagePct * 100), 10000);
 
     // Get quote from Universal Router
+    // Use a placeholder address for quotes when no wallet is provided
+    const recipient = walletAddress || '0x0000000000000000000000000000000000000001';
     const quoteResult = await this.universalRouter.getQuote(
       inputToken,
       outputToken,
@@ -223,8 +228,62 @@ export class Uniswap {
       {
         slippageTolerance,
         deadline: Math.floor(Date.now() / 1000 + 1800), // 30 minutes
-        recipient: walletAddress,
+        recipient,
         protocols: protocolsToUse,
+      },
+    );
+
+    return quoteResult;
+  }
+
+  /**
+   * Get a quote using AlphaRouter's split routing for optimal execution
+   * This uses Uniswap's smart order router to find the best route across V2, V3, and mixed pools
+   * with optimal split percentages for better execution prices.
+   *
+   * @param inputToken The token being swapped from
+   * @param outputToken The token being swapped to
+   * @param amount The amount to swap
+   * @param side The trade direction (BUY or SELL)
+   * @param walletAddress The recipient wallet address
+   * @param slippagePct Optional slippage percentage (defaults to config value)
+   * @returns Quote result with split routing information
+   */
+  public async getAlphaRouterQuote(
+    inputToken: Token,
+    outputToken: Token,
+    amount: number,
+    side: 'BUY' | 'SELL',
+    walletAddress: string,
+    slippagePct?: number,
+  ): Promise<AlphaRouterQuoteResult> {
+    if (!this.alphaRouter) {
+      throw new Error(`AlphaRouter not available for network ${this.networkName}`);
+    }
+
+    // Determine input/output based on side
+    const exactIn = side === 'SELL';
+    const tokenForAmount = exactIn ? inputToken : outputToken;
+
+    // Convert amount to token units using ethers parseUnits for proper decimal handling
+    const { parseUnits } = await import('ethers/lib/utils');
+    const rawAmount = parseUnits(amount.toString(), tokenForAmount.decimals);
+    const tradeAmount = CurrencyAmount.fromRawAmount(tokenForAmount, rawAmount.toString());
+
+    // Use provided slippage or fall back to config
+    const slippage = slippagePct ?? this.config.slippagePct;
+    const slippageTolerance = new Percent(Math.floor(slippage * 100), 10000);
+
+    // Get quote from AlphaRouter
+    const quoteResult = await this.alphaRouter.getQuote(
+      inputToken,
+      outputToken,
+      tradeAmount,
+      exactIn ? TradeType.EXACT_INPUT : TradeType.EXACT_OUTPUT,
+      {
+        slippageTolerance,
+        deadline: Math.floor(Date.now() / 1000 + 1800), // 30 minutes
+        recipient: walletAddress,
       },
     );
 
@@ -239,10 +298,9 @@ export class Uniswap {
       // Resolve pool address if provided
       let pairAddress = poolAddress;
 
-      // If tokenA and tokenB are strings, assume they are symbols
-      const tokenAObj = typeof tokenA === 'string' ? this.getTokenBySymbol(tokenA) : tokenA;
-
-      const tokenBObj = typeof tokenB === 'string' ? this.getTokenBySymbol(tokenB) : tokenB;
+      // If tokenA and tokenB are strings, resolve them to Token objects
+      const tokenAObj = typeof tokenA === 'string' ? await this.getToken(tokenA) : tokenA;
+      const tokenBObj = typeof tokenB === 'string' ? await this.getToken(tokenB) : tokenB;
 
       if (!tokenAObj || !tokenBObj) {
         throw new Error(`Invalid tokens: ${tokenA}, ${tokenB}`);
@@ -297,10 +355,9 @@ export class Uniswap {
       // Resolve pool address if provided
       let poolAddr = poolAddress;
 
-      // If tokenA and tokenB are strings, assume they are symbols
-      const tokenAObj = typeof tokenA === 'string' ? this.getTokenBySymbol(tokenA) : tokenA;
-
-      const tokenBObj = typeof tokenB === 'string' ? this.getTokenBySymbol(tokenB) : tokenB;
+      // If tokenA and tokenB are strings, resolve them to Token objects
+      const tokenAObj = typeof tokenA === 'string' ? await this.getToken(tokenA) : tokenA;
+      const tokenBObj = typeof tokenB === 'string' ? await this.getToken(tokenB) : tokenB;
 
       if (!tokenAObj || !tokenBObj) {
         throw new Error(`Invalid tokens: ${tokenA}, ${tokenB}`);
@@ -395,16 +452,19 @@ export class Uniswap {
       logger.info(`Finding ${poolType} pool for ${baseToken}-${quoteToken} on ${this.networkName}`);
 
       // Resolve token symbols if addresses are provided
-      const baseTokenInfo = this.getTokenBySymbol(baseToken) || this.getTokenByAddress(baseToken);
-      const quoteTokenInfo = this.getTokenBySymbol(quoteToken) || this.getTokenByAddress(quoteToken);
+      const baseTokenInfo = await this.ethereum.getToken(baseToken);
+      const quoteTokenInfo = await this.ethereum.getToken(quoteToken);
 
       if (!baseTokenInfo || !quoteTokenInfo) {
         logger.warn(`Token not found: ${!baseTokenInfo ? baseToken : quoteToken}`);
         return null;
       }
 
+      const baseToken_sdk = this.getUniswapToken(baseTokenInfo);
+      const quoteToken_sdk = this.getUniswapToken(quoteTokenInfo);
+
       logger.info(
-        `Resolved tokens: ${baseTokenInfo.symbol} (${baseTokenInfo.address}), ${quoteTokenInfo.symbol} (${quoteTokenInfo.address})`,
+        `Resolved tokens: ${baseToken_sdk.symbol} (${baseToken_sdk.address}), ${quoteToken_sdk.symbol} (${quoteToken_sdk.address})`,
       );
 
       // Use PoolService to find pool by token pair

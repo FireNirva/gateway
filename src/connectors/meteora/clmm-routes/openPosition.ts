@@ -3,10 +3,11 @@ import { Static } from '@sinclair/typebox';
 import { Keypair, PublicKey, Transaction } from '@solana/web3.js';
 import { BN } from 'bn.js';
 import { Decimal } from 'decimal.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { OpenPositionResponse, OpenPositionResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraConfig } from '../meteora.config';
@@ -26,7 +27,6 @@ const SOL_POSITION_RENT = 0.05; // SOL amount required for position rent
 const SOL_TRANSACTION_BUFFER = 0.01; // Additional SOL buffer for transaction costs
 
 export async function openPosition(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   lowerPrice: number,
@@ -34,7 +34,7 @@ export async function openPosition(
   poolAddress: string,
   baseTokenAmount: number | undefined,
   quoteTokenAmount: number | undefined,
-  slippagePct?: number,
+  slippagePct: number = MeteoraConfig.config.slippagePct,
   strategyType?: number,
 ): Promise<OpenPositionResponseType> {
   const solana = await Solana.getInstance(network);
@@ -43,10 +43,13 @@ export async function openPosition(
   // Validate addresses first
   try {
     new PublicKey(poolAddress);
+  } catch {
+    throw httpErrors.badRequest(`Invalid pool address: ${poolAddress}`);
+  }
+  try {
     new PublicKey(walletAddress);
-  } catch (error) {
-    const invalidAddress = error.message.includes(poolAddress) ? 'pool' : 'wallet';
-    throw fastify.httpErrors.badRequest(INVALID_SOLANA_ADDRESS_MESSAGE(invalidAddress));
+  } catch {
+    throw httpErrors.badRequest(`Invalid wallet address: ${walletAddress}`);
   }
 
   const wallet = await solana.getWallet(walletAddress);
@@ -56,11 +59,15 @@ export async function openPosition(
   try {
     dlmmPool = await meteora.getDlmmPool(poolAddress);
     if (!dlmmPool) {
-      throw fastify.httpErrors.notFound(POOL_NOT_FOUND_MESSAGE(poolAddress));
+      throw httpErrors.notFound(POOL_NOT_FOUND_MESSAGE(poolAddress));
     }
   } catch (error) {
     if (error instanceof Error && error.message.includes('Invalid account discriminator')) {
-      throw fastify.httpErrors.notFound(POOL_NOT_FOUND_MESSAGE(poolAddress));
+      throw httpErrors.notFound(POOL_NOT_FOUND_MESSAGE(poolAddress));
+    }
+    // Handle InvalidPositionWidth error from Meteora SDK
+    if (error instanceof Error && error.message.includes('InvalidPositionWidth')) {
+      throw httpErrors.badRequest('Invalid position width. Please use a position width of 69 bins or lower.');
     }
     throw error; // Re-throw unexpected errors
   }
@@ -71,27 +78,11 @@ export async function openPosition(
   const tokenYSymbol = tokenY?.symbol || 'UNKNOWN';
 
   if (!baseTokenAmount && !quoteTokenAmount) {
-    throw fastify.httpErrors.badRequest(MISSING_AMOUNTS_MESSAGE);
+    throw httpErrors.badRequest(MISSING_AMOUNTS_MESSAGE);
   }
 
-  // Check balances with SOL buffer
-  const balances = await solana.getBalance(wallet, [tokenXSymbol, tokenYSymbol, 'SOL']);
-  const requiredBaseAmount =
-    (baseTokenAmount || 0) + (tokenXSymbol === 'SOL' ? SOL_POSITION_RENT + SOL_TRANSACTION_BUFFER : 0);
-  const requiredQuoteAmount =
-    (quoteTokenAmount || 0) + (tokenYSymbol === 'SOL' ? SOL_POSITION_RENT + SOL_TRANSACTION_BUFFER : 0);
-
-  if (balances[tokenXSymbol] < requiredBaseAmount) {
-    throw fastify.httpErrors.badRequest(
-      INSUFFICIENT_BALANCE_MESSAGE(tokenXSymbol, requiredBaseAmount.toString(), balances[tokenXSymbol].toString()),
-    );
-  }
-
-  if (tokenYSymbol && balances[tokenYSymbol] < requiredQuoteAmount) {
-    throw fastify.httpErrors.badRequest(
-      `Insufficient ${tokenYSymbol} balance. Required: ${requiredQuoteAmount}, Available: ${balances[tokenYSymbol]}`,
-    );
-  }
+  // Note: Balance validation removed - insufficient balance will be caught during transaction execution
+  // This avoids issues with the deprecated getBalance() method and aligns with PancakeSwap-Sol behavior
 
   // Get current pool price from active bin
   const activeBin = await dlmmPool.getActiveBin();
@@ -100,7 +91,7 @@ export async function openPosition(
   // Validate price position requirements
   if (currentPrice < lowerPrice) {
     if (!baseTokenAmount || baseTokenAmount <= 0 || (quoteTokenAmount !== undefined && quoteTokenAmount !== 0)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         OPEN_POSITION_ERROR_MESSAGE(
           `Current price ${currentPrice.toFixed(4)} is below lower price ${lowerPrice.toFixed(4)}. ` +
             `Requires positive ${tokenXSymbol} amount and zero ${tokenYSymbol} amount.`,
@@ -109,7 +100,7 @@ export async function openPosition(
     }
   } else if (currentPrice > upperPrice) {
     if (!quoteTokenAmount || quoteTokenAmount <= 0 || (baseTokenAmount !== undefined && baseTokenAmount !== 0)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         OPEN_POSITION_ERROR_MESSAGE(
           `Current price ${currentPrice.toFixed(4)} is above upper price ${upperPrice.toFixed(4)}. ` +
             `Requires positive ${tokenYSymbol} amount and zero ${tokenXSymbol} amount.`,
@@ -124,12 +115,12 @@ export async function openPosition(
   const maxBinId = dlmmPool.getBinIdFromPrice(Number(upperPricePerLamport), false);
 
   // Don't add SOL rent to the liquidity amounts - rent is separate
-  const totalXAmount = new BN(DecimalUtil.toBN(new Decimal(baseTokenAmount || 0), dlmmPool.tokenX.decimal));
-  const totalYAmount = new BN(DecimalUtil.toBN(new Decimal(quoteTokenAmount || 0), dlmmPool.tokenY.decimal));
+  const totalXAmount = new BN(DecimalUtil.toBN(new Decimal(baseTokenAmount || 0), dlmmPool.tokenX.mint.decimals));
+  const totalYAmount = new BN(DecimalUtil.toBN(new Decimal(quoteTokenAmount || 0), dlmmPool.tokenY.mint.decimals));
 
   // Create position transaction following SDK example
   // Slippage needs to be in BPS (basis points): percentage * 100
-  const slippageBps = slippagePct ? slippagePct * 100 : undefined;
+  const slippageBps = slippagePct * 100;
 
   const createPositionTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
     positionPubKey: newImbalancePosition.publicKey,
@@ -163,7 +154,7 @@ export async function openPosition(
   createPositionTx.feePayer = wallet.publicKey;
 
   // Simulate with error handling (no signing needed for simulation)
-  await solana.simulateWithErrorHandling(createPositionTx, fastify);
+  await solana.simulateWithErrorHandling(createPositionTx);
 
   logger.info('Transaction simulated successfully, sending to network...');
 
@@ -184,8 +175,8 @@ export async function openPosition(
 
   if (confirmed && txData) {
     const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, wallet.publicKey.toBase58(), [
-      tokenX.address,
-      tokenY.address,
+      tokenX?.address || dlmmPool.tokenX.publicKey.toBase58(),
+      tokenY?.address || dlmmPool.tokenY.publicKey.toBase58(),
     ]);
 
     const baseTokenBalanceChange = balanceChanges[0];
@@ -254,7 +245,6 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
         const networkToUse = network;
 
         return await openPosition(
-          fastify,
           networkToUse,
           walletAddress,
           lowerPrice,
@@ -268,9 +258,9 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {
-          throw fastify.httpErrors.createError(e.statusCode, 'Request failed');
+          throw e; // Re-throw HttpErrors with original message
         }
-        throw fastify.httpErrors.internalServerError('Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

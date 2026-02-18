@@ -45,10 +45,11 @@ describe('PancakeSwap Solana Connector', () => {
       }
     }, 30000);
 
-    it('should throw error for invalid pool address', async () => {
+    it('should return null for invalid pool address', async () => {
       const invalidPool = '11111111111111111111111111111111';
 
-      await expect(pancakeswapSol.getClmmPoolInfo(invalidPool)).rejects.toThrow();
+      const result = await pancakeswapSol.getClmmPoolInfo(invalidPool);
+      expect(result).toBeNull();
     }, 30000);
   });
 
@@ -85,7 +86,7 @@ describe('PancakeSwap Solana Connector', () => {
         }
       } catch (error: any) {
         // Position may have been closed - skip test
-        if (error.message.includes('Position account not found')) {
+        if (error.message.includes('Position not found') || error.statusCode === 404) {
           console.log('\n⚠️  Test position has been closed - skipping test');
           expect(true).toBe(true); // Mark test as passed
         } else {

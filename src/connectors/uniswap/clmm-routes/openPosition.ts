@@ -1,16 +1,8 @@
 import { Contract } from '@ethersproject/contracts';
-import { Token, CurrencyAmount, Percent } from '@uniswap/sdk-core';
-import {
-  Position,
-  Pool as V3Pool,
-  NonfungiblePositionManager,
-  MintOptions,
-  nearestUsableTick,
-  tickToPrice,
-  FeeAmount,
-} from '@uniswap/v3-sdk';
+import { CurrencyAmount, Percent } from '@uniswap/sdk-core';
+import { Position, NonfungiblePositionManager, MintOptions, nearestUsableTick } from '@uniswap/v3-sdk';
 import { BigNumber } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 
 // Default gas limit for CLMM open position operations
@@ -23,14 +15,15 @@ import {
   OpenPositionResponseType,
   OpenPositionResponse,
 } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
 import { Uniswap } from '../uniswap';
+import { UniswapConfig } from '../uniswap.config';
 import { getUniswapV3NftManagerAddress } from '../uniswap.contracts';
-import { formatTokenAmount, parseFeeTier, getUniswapPoolInfo } from '../uniswap.utils';
+import { formatTokenAmount, getUniswapPoolInfo } from '../uniswap.utils';
 
 export async function openPosition(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   lowerPrice: number,
@@ -38,11 +31,11 @@ export async function openPosition(
   poolAddress: string,
   baseTokenAmount?: number,
   quoteTokenAmount?: number,
-  slippagePct?: number,
+  slippagePct: number = UniswapConfig.config.slippagePct,
 ): Promise<OpenPositionResponseType> {
   // Validate essential parameters
   if (!lowerPrice || !upperPrice || !poolAddress || (baseTokenAmount === undefined && quoteTokenAmount === undefined)) {
-    throw fastify.httpErrors.badRequest('Missing required parameters');
+    throw httpErrors.badRequest('Missing required parameters');
   }
 
   // Get Uniswap and Ethereum instances
@@ -52,30 +45,30 @@ export async function openPosition(
   // Get pool information to determine tokens
   const poolInfo = await getUniswapPoolInfo(poolAddress, network, 'clmm');
   if (!poolInfo) {
-    throw fastify.httpErrors.notFound(sanitizeErrorMessage('Pool not found: {}', poolAddress));
+    throw httpErrors.notFound(sanitizeErrorMessage('Pool not found: {}', poolAddress));
   }
 
-  const baseTokenObj = uniswap.getTokenByAddress(poolInfo.baseTokenAddress);
-  const quoteTokenObj = uniswap.getTokenByAddress(poolInfo.quoteTokenAddress);
+  const baseTokenObj = await uniswap.getToken(poolInfo.baseTokenAddress);
+  const quoteTokenObj = await uniswap.getToken(poolInfo.quoteTokenAddress);
 
   if (!baseTokenObj || !quoteTokenObj) {
-    throw fastify.httpErrors.badRequest('Token information not found for pool');
+    throw httpErrors.badRequest('Token information not found for pool');
   }
 
   // Get the wallet
   const wallet = await ethereum.getWallet(walletAddress);
   if (!wallet) {
-    throw fastify.httpErrors.badRequest('Wallet not found');
+    throw httpErrors.badRequest('Wallet not found');
   }
 
   // Get the V3 pool
   const pool = await uniswap.getV3Pool(baseTokenObj, quoteTokenObj, undefined, poolAddress);
   if (!pool) {
-    throw fastify.httpErrors.notFound(`Pool not found for ${baseTokenObj.symbol}-${quoteTokenObj.symbol}`);
+    throw httpErrors.notFound(`Pool not found for ${baseTokenObj.symbol}-${quoteTokenObj.symbol}`);
   }
 
   // Calculate slippage tolerance
-  const slippageTolerance = new Percent(Math.floor((slippagePct ?? uniswap.config.slippagePct) * 100), 10000);
+  const slippageTolerance = new Percent(Math.floor(slippagePct * 100), 10000);
 
   // Convert price range to ticks
   const token0 = pool.token0;
@@ -103,7 +96,7 @@ export async function openPosition(
 
   // Ensure lower < upper
   if (lowerTick >= upperTick) {
-    throw fastify.httpErrors.badRequest('Lower price must be less than upper price');
+    throw httpErrors.badRequest('Lower price must be less than upper price');
   }
 
   // Calculate token amounts for the position
@@ -182,7 +175,7 @@ export async function openPosition(
     logger.info(`${token0.symbol} required: ${formatTokenAmount(requiredAmount0.toString(), token0.decimals)}`);
 
     if (currentAllowance0.lt(requiredAmount0)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token0.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount0.toString(), token0.decimals)} ${token0.symbol} (${token0.address}) for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -205,7 +198,7 @@ export async function openPosition(
     logger.info(`${token1.symbol} required: ${formatTokenAmount(requiredAmount1.toString(), token1.decimals)}`);
 
     if (currentAllowance1.lt(requiredAmount1)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token1.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount1.toString(), token1.decimals)} ${token1.symbol} (${token1.address}) for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -242,7 +235,7 @@ export async function openPosition(
   }
 
   // Wait for transaction confirmation
-  const receipt = await tx.wait();
+  const receipt = await ethereum.handleTransactionExecution(tx);
 
   // Find the NFT ID from the transaction logs
   let positionId = '';
@@ -273,7 +266,7 @@ export async function openPosition(
 
   return {
     signature: receipt.transactionHash,
-    status: 1,
+    status: receipt.status,
     data: {
       fee: gasFee,
       positionAddress: positionId,
@@ -336,13 +329,12 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
           const uniswap = await Uniswap.getInstance(network);
           walletAddress = await uniswap.getFirstWalletAddress();
           if (!walletAddress) {
-            throw fastify.httpErrors.badRequest('No wallet address provided and no default wallet found');
+            throw httpErrors.badRequest('No wallet address provided and no default wallet found');
           }
           logger.info(`Using first available wallet address: ${walletAddress}`);
         }
 
         return await openPosition(
-          fastify,
           network,
           walletAddress,
           lowerPrice,
@@ -362,18 +354,18 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
 
         // Check for specific error types
         if (e.code === 'CALL_EXCEPTION') {
-          throw fastify.httpErrors.badRequest(
+          throw httpErrors.badRequest(
             'Transaction failed. Please check token balances, approvals, and position parameters.',
           );
         }
 
         // Handle insufficient funds errors
         if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('insufficient funds'))) {
-          throw fastify.httpErrors.badRequest('Insufficient funds to complete the transaction');
+          throw httpErrors.badRequest('Insufficient funds to complete the transaction');
         }
 
         // Generic error
-        throw fastify.httpErrors.internalServerError('Failed to open position');
+        throw httpErrors.internalServerError('Failed to open position');
       }
     },
   );

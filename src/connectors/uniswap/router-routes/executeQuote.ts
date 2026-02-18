@@ -1,11 +1,11 @@
 import { BigNumber, utils, ethers } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { EthereumLedger } from '../../../chains/ethereum/ethereum-ledger';
 import { getEthereumChainConfig } from '../../../chains/ethereum/ethereum.config';
-import { waitForTransactionWithTimeout } from '../../../chains/ethereum/ethereum.utils';
 import { ExecuteQuoteRequestType, SwapExecuteResponseType, SwapExecuteResponse } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { quoteCache } from '../../../services/quote-cache';
 import { UniswapExecuteQuoteRequest } from '../schemas';
@@ -13,16 +13,11 @@ import { UniswapExecuteQuoteRequest } from '../schemas';
 // Permit2 address is constant across all chains
 const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
-async function executeQuote(
-  fastify: FastifyInstance,
-  walletAddress: string,
-  network: string,
-  quoteId: string,
-): Promise<SwapExecuteResponseType> {
+async function executeQuote(walletAddress: string, network: string, quoteId: string): Promise<SwapExecuteResponseType> {
   // Retrieve cached quote
   const cached = quoteCache.get(quoteId);
   if (!cached) {
-    throw fastify.httpErrors.badRequest('Quote not found or expired');
+    throw httpErrors.badRequest('Quote not found or expired');
   }
 
   const { quote, request } = cached;
@@ -51,7 +46,7 @@ async function executeQuote(
       const inputAmount = utils.formatUnits(requiredAllowance, inputToken.decimals);
       const currentAllowance = utils.formatUnits(tokenToPermit2Allowance, inputToken.decimals);
 
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${inputToken.symbol} allowance to Permit2. ` +
           `Required: ${inputAmount}, Current: ${currentAllowance}. ` +
           `Please approve ${inputToken.symbol} using spender: "uniswap/router"`,
@@ -97,13 +92,13 @@ async function executeQuote(
 
       if (isExpired) {
         const expirationDate = new Date(expiration * 1000);
-        throw fastify.httpErrors.badRequest(
+        throw httpErrors.badRequest(
           `Permit2 allowance for ${inputToken.symbol} to Universal Router has expired. ` +
             `Expired at: ${expirationDate.toISOString()}. ` +
             `Please approve ${inputToken.symbol} again using spender: "uniswap/router"`,
         );
       } else {
-        throw fastify.httpErrors.badRequest(
+        throw httpErrors.badRequest(
           `Insufficient Permit2 allowance for ${inputToken.symbol} to Universal Router. ` +
             `Required: ${inputAmount}, Current: ${currentPermit2Allowance}. ` +
             `Please approve ${inputToken.symbol} using spender: "uniswap/router"`,
@@ -115,7 +110,8 @@ async function executeQuote(
   }
 
   // Execute the swap transaction
-  let txReceipt;
+  let txReceipt: Awaited<ReturnType<typeof ethereum.handleTransactionExecution>> = null;
+  let txHash: string | undefined;
 
   try {
     if (isHardwareWallet) {
@@ -144,9 +140,11 @@ async function executeQuote(
 
       // Send the signed transaction
       const txResponse = await ethereum.provider.sendTransaction(signedTx);
+      txHash = txResponse.hash;
+      logger.info(`Transaction sent: ${txHash}`);
 
-      // Wait for confirmation with timeout (30 seconds for hardware wallets)
-      txReceipt = await waitForTransactionWithTimeout(txResponse, 30000);
+      // Wait for confirmation with timeout
+      txReceipt = await ethereum.handleTransactionExecution(txResponse);
     } else {
       // Regular wallet flow
       let wallet;
@@ -154,7 +152,7 @@ async function executeQuote(
         wallet = await ethereum.getWallet(walletAddress);
       } catch (err) {
         logger.error(`Failed to load wallet: ${err.message}`);
-        throw fastify.httpErrors.internalServerError(`Failed to load wallet: ${err.message}`);
+        throw httpErrors.internalServerError(`Failed to load wallet: ${err.message}`);
       }
 
       // Get gas options with increased gas limit for Universal Router V2
@@ -176,10 +174,11 @@ async function executeQuote(
 
       // Send transaction directly without relying on ethers' automatic gas estimation
       const txResponse = await wallet.sendTransaction(txData);
-      logger.info(`Transaction sent: ${txResponse.hash}`);
+      txHash = txResponse.hash;
+      logger.info(`Transaction sent: ${txHash}`);
 
       // Wait for transaction confirmation with timeout
-      txReceipt = await waitForTransactionWithTimeout(txResponse);
+      txReceipt = await ethereum.handleTransactionExecution(txResponse);
     }
 
     // Log transaction info if available
@@ -212,19 +211,19 @@ async function executeQuote(
     // Handle specific Universal Router error codes
     if (errorSelector === '0xd81b2f2e') {
       // AllowanceExpired error from Permit2
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Universal Router error: Permit2 allowance has expired for ${inputToken.symbol}. ` +
           `Please re-approve the token using spender: "uniswap/router" to set a new expiration.`,
       );
     } else if (errorSelector === '0x39d35496' || errorData.includes('TooLittleReceived')) {
       // V2TooLittleReceived / InsufficientAmountOut error
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Swap failed: Slippage tolerance exceeded. The output amount would be less than your minimum acceptable amount. ` +
           `Try increasing slippage tolerance or request a new quote.`,
       );
     } else if (errorSelector === '0x963b34a5' || errorData.includes('TooMuchInputPaid')) {
       // V2TooMuchInputPaid error
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Swap failed: Slippage tolerance exceeded. The input amount would be more than your maximum acceptable amount. ` +
           `Try increasing slippage tolerance or request a new quote.`,
       );
@@ -232,7 +231,7 @@ async function executeQuote(
 
     // Handle general error patterns
     if (error.message && error.message.includes('insufficient funds')) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         'Insufficient funds for transaction. Please ensure you have enough ETH to cover gas costs.',
       );
     } else if (error.message && error.message.includes('cannot estimate gas')) {
@@ -241,17 +240,17 @@ async function executeQuote(
       if (errorData) {
         extraContext = ` The transaction would revert with error: ${errorSelector}. Check logs for details.`;
       }
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         'Transaction simulation failed. This usually means the transaction would revert on-chain. ' +
           `Common causes: expired Permit2 allowance, insufficient balance, slippage tolerance too tight, or quote expired.${extraContext} ` +
           'Please check token approvals and request a new quote.',
       );
     } else if (error.message.includes('rejected on Ledger')) {
-      throw fastify.httpErrors.badRequest('Transaction rejected on Ledger device');
+      throw httpErrors.badRequest('Transaction rejected on Ledger device');
     } else if (error.message.includes('Ledger device is locked')) {
-      throw fastify.httpErrors.badRequest(error.message);
+      throw httpErrors.badRequest(error.message);
     } else if (error.message.includes('Wrong app is open')) {
-      throw fastify.httpErrors.badRequest(error.message);
+      throw httpErrors.badRequest(error.message);
     }
 
     // Re-throw if already a fastify error
@@ -259,28 +258,31 @@ async function executeQuote(
       throw error;
     }
 
-    throw fastify.httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
+    throw httpErrors.internalServerError(`Failed to execute swap: ${error.message}`);
   }
 
   // Calculate expected amounts from the trade
   const expectedAmountIn = parseFloat(quote.trade.inputAmount.toExact());
   const expectedAmountOut = parseFloat(quote.trade.outputAmount.toExact());
 
-  // Use the new handleTransactionConfirmation helper
-  const result = ethereum.handleTransactionConfirmation(
+  // Use the new handleExecuteQuoteTransactionConfirmation helper
+  // Pass txHash for pending transactions (when txReceipt is null)
+  const result = ethereum.handleExecuteQuoteTransactionConfirmation(
     txReceipt,
     inputToken.address,
     outputToken.address,
     expectedAmountIn,
     expectedAmountOut,
     side,
+    txHash,
   );
 
   // Handle different transaction states
+  // Status codes: 1 = CONFIRMED, 0 = PENDING, -1 = FAILED
   if (result.status === -1) {
     // Transaction failed
     logger.error(`Transaction failed on-chain. Receipt: ${JSON.stringify(txReceipt)}`);
-    throw fastify.httpErrors.internalServerError(
+    throw httpErrors.internalServerError(
       'Transaction reverted on-chain. This could be due to slippage, expired quote, insufficient funds, or other blockchain issues.',
     );
   }
@@ -326,11 +328,11 @@ export const executeQuoteRoute: FastifyPluginAsync = async (fastify) => {
           quoteId,
         } = request.body as typeof UniswapExecuteQuoteRequest._type;
 
-        return await executeQuote(fastify, walletAddress, network, quoteId);
+        return await executeQuote(walletAddress, network, quoteId);
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing quote:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

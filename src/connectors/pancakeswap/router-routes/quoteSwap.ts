@@ -1,10 +1,11 @@
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { getEthereumChainConfig } from '../../../chains/ethereum/ethereum.config';
 import { QuoteSwapRequestType } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { quoteCache } from '../../../services/quote-cache';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
@@ -13,32 +14,29 @@ import { PancakeswapConfig } from '../pancakeswap.config';
 import { PancakeswapQuoteSwapRequest, PancakeswapQuoteSwapResponse } from '../schemas';
 
 async function quoteSwap(
-  fastify: FastifyInstance,
   network: string,
-  walletAddress: string,
+  walletAddress: string | undefined,
   baseToken: string,
   quoteToken: string,
   amount: number,
   side: 'BUY' | 'SELL',
-  slippagePct: number,
+  slippagePct: number = PancakeswapConfig.config.slippagePct,
 ): Promise<Static<typeof PancakeswapQuoteSwapResponse>> {
   logger.info(`[quoteSwap] Starting quote generation`);
-  logger.info(`[quoteSwap] Network: ${network}, Wallet: ${walletAddress}`);
+  logger.info(`[quoteSwap] Network: ${network}, Wallet: ${walletAddress || 'not provided'}`);
   logger.info(`[quoteSwap] Base: ${baseToken}, Quote: ${quoteToken}`);
   logger.info(`[quoteSwap] Amount: ${amount}, Side: ${side}, Slippage: ${slippagePct}%`);
 
   const ethereum = await Ethereum.getInstance(network);
   const pancakeswap = await Pancakeswap.getInstance(network);
 
-  // Resolve token symbols to token objects
-  const baseTokenInfo = ethereum.getToken(baseToken);
-  const quoteTokenInfo = ethereum.getToken(quoteToken);
+  // Resolve token symbols/addresses to token objects from local token list
+  const baseTokenInfo = await ethereum.getToken(baseToken);
+  const quoteTokenInfo = await ethereum.getToken(quoteToken);
 
   if (!baseTokenInfo || !quoteTokenInfo) {
     logger.error(`[quoteSwap] Token not found: ${!baseTokenInfo ? baseToken : quoteToken}`);
-    throw fastify.httpErrors.notFound(
-      sanitizeErrorMessage('Token not found: {}', !baseTokenInfo ? baseToken : quoteToken),
-    );
+    throw httpErrors.notFound(sanitizeErrorMessage('Token not found: {}', !baseTokenInfo ? baseToken : quoteToken));
   }
 
   logger.info(`[quoteSwap] Base token: ${baseTokenInfo.symbol} (${baseTokenInfo.address})`);
@@ -164,11 +162,10 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
           quoteToken,
           amount,
           side,
-          slippagePct = PancakeswapConfig.config.slippagePct,
+          slippagePct,
         } = request.query as typeof PancakeswapQuoteSwapRequest._type;
 
         return await quoteSwap(
-          fastify,
           network,
           walletAddress,
           baseToken,
@@ -180,7 +177,7 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error getting quote:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

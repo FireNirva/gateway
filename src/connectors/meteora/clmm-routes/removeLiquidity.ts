@@ -1,6 +1,7 @@
 import { BN } from '@coral-xyz/anchor';
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { PublicKey } from '@solana/web3.js';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import {
@@ -8,16 +9,15 @@ import {
   RemoveLiquidityRequestType,
   RemoveLiquidityResponseType,
 } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraClmmRemoveLiquidityRequest } from '../schemas';
 
-// Using Fastify's native error handling
+// Using centralized error handling
 const INVALID_SOLANA_ADDRESS_MESSAGE = (address: string) => `Invalid Solana address: ${address}`;
-import { PublicKey } from '@solana/web3.js';
 
 export async function removeLiquidity(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
@@ -29,18 +29,19 @@ export async function removeLiquidity(
 
   try {
     new PublicKey(positionAddress);
+  } catch {
+    throw httpErrors.badRequest(`Invalid position address: ${positionAddress}`);
+  }
+  try {
     new PublicKey(walletAddress);
-  } catch (error) {
-    const invalidAddress = error.message.includes(positionAddress) ? 'position' : 'wallet';
-    throw fastify.httpErrors.badRequest(INVALID_SOLANA_ADDRESS_MESSAGE(invalidAddress));
+  } catch {
+    throw httpErrors.badRequest(`Invalid wallet address: ${walletAddress}`);
   }
 
   const positionResult = await meteora.getRawPosition(positionAddress, wallet.publicKey);
 
   if (!positionResult || !positionResult.position) {
-    throw fastify.httpErrors.notFound(
-      `Position not found: ${positionAddress}. Please provide a valid position address`,
-    );
+    throw httpErrors.notFound(`Position not found: ${positionAddress}. Please provide a valid position address`);
   }
 
   const { position, info } = positionResult;
@@ -51,59 +52,48 @@ export async function removeLiquidity(
   const tokenYSymbol = tokenY?.symbol || 'UNKNOWN';
 
   logger.info(`Removing ${percentageToRemove.toFixed(4)}% liquidity from position ${positionAddress}`);
-  const binIdsToRemove = position.positionData.positionBinData.map((bin) => bin.binId);
   const bps = new BN(percentageToRemove * 100);
+
+  // SDK v1.7.5 uses fromBinId and toBinId instead of binIds array
+  const fromBinId = position.positionData.lowerBinId;
+  const toBinId = position.positionData.upperBinId;
 
   const removeLiquidityTx = await dlmmPool.removeLiquidity({
     position: position.publicKey,
     user: wallet.publicKey,
-    binIds: binIdsToRemove,
+    fromBinId,
+    toBinId,
     bps: bps,
     shouldClaimAndClose: false,
   });
 
-  // Handle both single transaction and array of transactions
-  let signature: string;
-  let fee: number;
+  // Handle both single transaction and array of transactions (SDK v1.7.5 may return either)
+  const transactions = Array.isArray(removeLiquidityTx) ? removeLiquidityTx : [removeLiquidityTx];
 
-  if (Array.isArray(removeLiquidityTx)) {
-    // If multiple transactions are returned, execute them in sequence
-    logger.info(`Received ${removeLiquidityTx.length} transactions for removing liquidity`);
+  let totalFee = 0;
+  let lastSignature = '';
 
-    let totalFee = 0;
-    let lastSignature = '';
-
-    for (let i = 0; i < removeLiquidityTx.length; i++) {
-      const tx = removeLiquidityTx[i];
-      logger.info(`Executing transaction ${i + 1} of ${removeLiquidityTx.length}`);
-
-      // Set fee payer for simulation
-      tx.feePayer = wallet.publicKey;
-
-      // Simulate before sending
-      await solana.simulateWithErrorHandling(tx, fastify);
-
-      const result = await solana.sendAndConfirmTransaction(tx, [wallet]);
-      totalFee += result.fee;
-      lastSignature = result.signature;
+  for (let i = 0; i < transactions.length; i++) {
+    const tx = transactions[i];
+    if (transactions.length > 1) {
+      logger.info(`Executing transaction ${i + 1} of ${transactions.length}`);
     }
 
-    signature = lastSignature;
-    fee = totalFee;
-  } else {
-    // Single transaction case
     // Set fee payer for simulation
-    removeLiquidityTx.feePayer = wallet.publicKey;
+    tx.feePayer = wallet.publicKey;
 
-    // Simulate with error handling
-    await solana.simulateWithErrorHandling(removeLiquidityTx, fastify);
+    // Simulate before sending
+    await solana.simulateWithErrorHandling(tx);
 
     logger.info('Transaction simulated successfully, sending to network...');
 
-    const result = await solana.sendAndConfirmTransaction(removeLiquidityTx, [wallet]);
-    signature = result.signature;
-    fee = result.fee;
+    const result = await solana.sendAndConfirmTransaction(tx, [wallet]);
+    totalFee += result.fee;
+    lastSignature = result.signature;
   }
+
+  const signature = lastSignature;
+  const fee = totalFee;
 
   // Get transaction data for confirmation
   const txData = await solana.connection.getTransaction(signature, {
@@ -114,7 +104,7 @@ export async function removeLiquidity(
   const confirmed = txData !== null;
 
   if (confirmed && txData) {
-    const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, dlmmPool.pubkey.toBase58(), [
+    const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, wallet.publicKey.toBase58(), [
       dlmmPool.tokenX.publicKey.toBase58(),
       dlmmPool.tokenY.publicKey.toBase58(),
     ]);
@@ -167,11 +157,11 @@ export const removeLiquidityRoute: FastifyPluginAsync = async (fastify) => {
 
         const networkToUse = network;
 
-        return await removeLiquidity(fastify, networkToUse, walletAddress, positionAddress, liquidityPct);
+        return await removeLiquidity(networkToUse, walletAddress, positionAddress, liquidityPct);
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {
-          throw fastify.httpErrors.createError(e.statusCode, 'Request failed');
+          throw e; // Re-throw HttpErrors with original message
         }
         throw fastify.httpErrors.internalServerError('Internal server error');
       }

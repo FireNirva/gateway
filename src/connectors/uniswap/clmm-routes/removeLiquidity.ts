@@ -2,7 +2,7 @@ import { Contract } from '@ethersproject/contracts';
 import { Percent, CurrencyAmount } from '@uniswap/sdk-core';
 import { NonfungiblePositionManager, Position } from '@uniswap/v3-sdk';
 import { BigNumber } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
@@ -12,6 +12,7 @@ import {
   RemoveLiquidityResponseType,
   RemoveLiquidityResponse,
 } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Uniswap } from '../uniswap';
 import { POSITION_MANAGER_ABI, getUniswapV3NftManagerAddress } from '../uniswap.contracts';
@@ -21,7 +22,6 @@ import { formatTokenAmount } from '../uniswap.utils';
 const CLMM_REMOVE_LIQUIDITY_GAS_LIMIT = 500000;
 
 export async function removeLiquidity(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
@@ -29,11 +29,11 @@ export async function removeLiquidity(
 ): Promise<RemoveLiquidityResponseType> {
   // Validate essential parameters
   if (!positionAddress || percentageToRemove === undefined) {
-    throw fastify.httpErrors.badRequest('Missing required parameters');
+    throw httpErrors.badRequest('Missing required parameters');
   }
 
   if (percentageToRemove < 0 || percentageToRemove > 100) {
-    throw fastify.httpErrors.badRequest('Percentage to remove must be between 0 and 100');
+    throw httpErrors.badRequest('Percentage to remove must be between 0 and 100');
   }
 
   // Get Uniswap and Ethereum instances
@@ -43,7 +43,7 @@ export async function removeLiquidity(
   // Get the wallet
   const wallet = await ethereum.getWallet(walletAddress);
   if (!wallet) {
-    throw fastify.httpErrors.badRequest('Wallet not found');
+    throw httpErrors.badRequest('Wallet not found');
   }
 
   // Get position manager address
@@ -54,9 +54,9 @@ export async function removeLiquidity(
     await uniswap.checkNFTOwnership(positionAddress, walletAddress);
   } catch (error: any) {
     if (error.message.includes('is not owned by')) {
-      throw fastify.httpErrors.forbidden(error.message);
+      throw httpErrors.forbidden(error.message);
     }
-    throw fastify.httpErrors.badRequest(error.message);
+    throw httpErrors.badRequest(error.message);
   }
 
   // Create position manager contract for reading position data
@@ -66,8 +66,8 @@ export async function removeLiquidity(
   const position = await positionManager.positions(positionAddress);
 
   // Get tokens by address
-  const token0 = uniswap.getTokenByAddress(position.token0);
-  const token1 = uniswap.getTokenByAddress(position.token1);
+  const token0 = await uniswap.getToken(position.token0);
+  const token1 = await uniswap.getToken(position.token1);
 
   // Determine base and quote tokens - WETH or lower address is base
   const isBaseToken0 =
@@ -83,7 +83,7 @@ export async function removeLiquidity(
   // Get the pool
   const pool = await uniswap.getV3Pool(token0, token1, position.fee);
   if (!pool) {
-    throw fastify.httpErrors.notFound('Pool not found for position');
+    throw httpErrors.notFound('Pool not found for position');
   }
 
   // Create a Position instance to calculate expected amounts
@@ -164,7 +164,7 @@ export async function removeLiquidity(
   const tx = await positionManagerWithSigner.multicall([calldata], txParams);
 
   // Wait for transaction confirmation
-  const receipt = await tx.wait();
+  const receipt = await ethereum.handleTransactionExecution(tx);
 
   // Calculate gas fee
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
@@ -179,7 +179,7 @@ export async function removeLiquidity(
 
   return {
     signature: receipt.transactionHash,
-    status: 1,
+    status: receipt.status,
     data: {
       fee: gasFee,
       baseTokenAmountRemoved,
@@ -239,7 +239,7 @@ export const removeLiquidityRoute: FastifyPluginAsync = async (fastify) => {
           }
         }
 
-        return await removeLiquidity(fastify, network, walletAddress, positionAddress, percentageToRemove);
+        return await removeLiquidity(network, walletAddress, positionAddress, percentageToRemove);
       } catch (e: any) {
         logger.error('Failed to remove liquidity:', e);
         if (e.statusCode) {

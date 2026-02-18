@@ -34,10 +34,7 @@ defaultNetwork: mainnet
 defaultWallet: default_wallet
 rpcProvider: standard
 
-# Etherscan API key for gas price estimates across all supported networks
-# Get your free API key from https://etherscan.io/myapikey
-# Works for Ethereum, Polygon, BSC (not available for Base, Arbitrum, Optimism)
-etherscanAPIKey: 'YOUR_ETHERSCAN_API_KEY_HERE'
+# Note: Etherscan API key is configured in conf/apiKeys.yml
 ```
 
 ## Gas Parameters Explained

@@ -26,5 +26,6 @@ logToStdOut: true
 fastifyLogs: false
 
 # Log level for the application (debug, info, warn, error)
-logLevel: debug
+logLevel: info
 
+# Note: API keys (CoinGecko, Etherscan, etc.) are configured in apiKeys.yml

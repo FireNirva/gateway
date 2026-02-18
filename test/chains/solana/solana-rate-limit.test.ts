@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 
-import { createRateLimitAwareConnection } from '../../../src/chains/solana/solana-connection-interceptor';
+import { createRateLimitAwareSolanaConnection } from '../../../src/rpc/rpc-connection-interceptor';
 
 describe('Solana Rate Limit Interceptor', () => {
   let mockConnection: jest.Mocked<Connection>;
@@ -19,7 +19,7 @@ describe('Solana Rate Limit Interceptor', () => {
       getSignatureStatus: jest.fn(),
     } as any;
 
-    wrappedConnection = createRateLimitAwareConnection(mockConnection, testRpcUrl);
+    wrappedConnection = createRateLimitAwareSolanaConnection(mockConnection, testRpcUrl);
   });
 
   describe('429 Error Detection', () => {
@@ -108,7 +108,7 @@ describe('Solana Rate Limit Interceptor', () => {
       });
     });
 
-    it('should include instructions to fix rate limit', async () => {
+    it('should include helpful error message with fix instructions', async () => {
       const error429 = new Error('Too many requests');
       (error429 as any).statusCode = 429;
 
@@ -117,48 +117,8 @@ describe('Solana Rate Limit Interceptor', () => {
       await expect(
         wrappedConnection.getBalance(new PublicKey('11111111111111111111111111111112')),
       ).rejects.toMatchObject({
-        message: expect.stringContaining("Update 'nodeURL'"),
-      });
-    });
-
-    it('should mention Helius as alternative', async () => {
-      const error429 = new Error('Too many requests');
-      (error429 as any).statusCode = 429;
-
-      mockConnection.getBalance.mockRejectedValue(error429);
-
-      await expect(
-        wrappedConnection.getBalance(new PublicKey('11111111111111111111111111111112')),
-      ).rejects.toMatchObject({
-        message: expect.stringContaining('Helius'),
-      });
-    });
-
-    it('should suggest correct network config file for mainnet-beta', async () => {
-      const error429 = new Error('Too many requests');
-      (error429 as any).statusCode = 429;
-
-      mockConnection.getBalance.mockRejectedValue(error429);
-
-      await expect(
-        wrappedConnection.getBalance(new PublicKey('11111111111111111111111111111112')),
-      ).rejects.toMatchObject({
-        message: expect.stringContaining('mainnet-beta.yml'),
-      });
-    });
-
-    it('should suggest correct network config file for devnet', async () => {
-      const error429 = new Error('Too many requests');
-      (error429 as any).statusCode = 429;
-
-      mockConnection.getBalance.mockRejectedValue(error429);
-
-      const devnetConnection = createRateLimitAwareConnection(mockConnection, 'https://api.devnet.solana.com');
-
-      await expect(
-        devnetConnection.getBalance(new PublicKey('11111111111111111111111111111112')),
-      ).rejects.toMatchObject({
-        message: expect.stringContaining('devnet.yml'),
+        statusCode: 429,
+        message: expect.stringContaining('rate limit'),
       });
     });
   });

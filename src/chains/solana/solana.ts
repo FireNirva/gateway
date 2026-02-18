@@ -9,6 +9,7 @@ import {
   createAssociatedTokenAccountInstruction,
   createSyncNativeInstruction,
   createCloseAccountInstruction,
+  AccountLayout,
 } from '@solana/spl-token';
 import { TokenInfo } from '@solana/spl-token-registry';
 import {
@@ -23,7 +24,6 @@ import {
   VersionedTransaction,
   VersionedTransactionResponse,
   SystemProgram,
-  LAMPORTS_PER_SOL,
   TransactionInstruction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
@@ -32,34 +32,21 @@ import fse from 'fs-extra';
 // TODO: Replace with Fastify httpErrors
 const SIMULATION_ERROR_MESSAGE = 'Transaction simulation failed: ';
 
+import { HeliusService } from '../../rpc/helius-service';
+import { createRateLimitAwareSolanaConnection } from '../../rpc/rpc-connection-interceptor';
+import { RPCProvider } from '../../rpc/rpc-provider-base';
 import { ConfigManagerCertPassphrase } from '../../services/config-manager-cert-passphrase';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
-import { logger } from '../../services/logger';
+import { logger, redactUrl } from '../../services/logger';
 import { TokenService } from '../../services/token-service';
 import { getSafeWalletFilePath, isHardwareWallet as isHardwareWalletUtil } from '../../wallet/utils';
 
-import { HeliusService } from './helius-service';
-import { createRateLimitAwareConnection } from './solana-connection-interceptor';
 import { SolanaPriorityFees } from './solana-priority-fees';
 import { SolanaNetworkConfig, getSolanaNetworkConfig, getSolanaChainConfig } from './solana.config';
 
 // Constants used for fee calculations
 export const BASE_FEE = 5000;
 const LAMPORT_TO_SOL = 1 / Math.pow(10, 9);
-
-// Jito tip accounts for bundles
-const JITO_TIP_ACCOUNTS = [
-  '4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE',
-  'D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ',
-  '9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta',
-  '5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn',
-  '2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD',
-  '2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWkcJ',
-  'wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF',
-  '3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT',
-  '4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey',
-  '4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or',
-];
 
 // Interface for token account data
 interface TokenAccount {
@@ -78,11 +65,8 @@ export class Solana {
   public network: string;
   public nativeTokenSymbol: string;
 
-  public tokenList: TokenInfo[] = [];
   public config: SolanaNetworkConfig;
-  private _tokenMap: Record<string, TokenInfo> = {};
-  private heliusService: HeliusService;
-  private heliusConfig: { useHeliusSender?: boolean; jitoTipSOL?: number } = {};
+  private rpcProviderService?: RPCProvider;
 
   private static _instances: { [name: string]: Solana };
 
@@ -97,13 +81,10 @@ export class Solana {
 
     // Initialize RPC connection based on provider
     if (rpcProvider === 'helius') {
-      logger.info(`Initializing Helius services for provider: ${rpcProvider}`);
       this.initializeHeliusProvider();
     } else {
       // Default: use nodeURL
-      logger.info(`Using standard RPC provider: ${rpcProvider}`);
-      logger.info(`Initializing Solana connector for network: ${this.network}, RPC URL: ${this.config.nodeURL}`);
-      this.connection = createRateLimitAwareConnection(
+      this.connection = createRateLimitAwareSolanaConnection(
         new Connection(this.config.nodeURL, {
           commitment: 'confirmed',
         }),
@@ -117,71 +98,44 @@ export class Solana {
    */
   private initializeHeliusProvider() {
     try {
-      // Load Helius config from rpc/helius.yml
+      // Load Helius config from apiKeys.yml
       const configManager = ConfigManagerV2.getInstance();
-      const heliusApiKey = configManager.get('helius.apiKey') || '';
-      const useWebSocketRPC = configManager.get('helius.useWebSocketRPC') || false;
-      const useSender = configManager.get('helius.useSender') || false;
-      const regionCode = configManager.get('helius.regionCode') || '';
-      const jitoTipSOL = configManager.get('helius.jitoTipSOL') || 0;
+      const apiKey = configManager.get('apiKeys.helius') || '';
 
-      // Store Helius-specific config
-      this.heliusConfig = {
-        useHeliusSender: useSender,
-        jitoTipSOL: jitoTipSOL,
-      };
-
-      // Merge configs for HeliusService
-      const mergedConfig = {
-        ...this.config,
-        heliusAPIKey: heliusApiKey,
-        useHeliusRestRPC: true, // Always true when using Helius provider
-        useHeliusWebSocketRPC: useWebSocketRPC,
-        useHeliusSender: useSender,
-        heliusRegionCode: regionCode,
-        jitoTipSOL: jitoTipSOL,
-      };
-
-      // Always use Helius RPC URL when Helius provider is selected
-      if (heliusApiKey && heliusApiKey.trim() !== '') {
-        const rpcUrl = this.network.includes('devnet')
-          ? `https://devnet.helius-rpc.com/?api-key=${heliusApiKey}`
-          : `https://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
-
-        logger.info(`Initializing Solana connector for network: ${this.network}, RPC URL: ${rpcUrl}`);
-        logger.info(`✅ Helius API key configured (length: ${heliusApiKey.length} chars)`);
-        logger.info(
-          `Helius features enabled - WebSocket: ${useWebSocketRPC}, Sender: ${useSender}, Region: ${regionCode || 'default'}`,
-        );
-
-        this.connection = createRateLimitAwareConnection(
-          new Connection(rpcUrl, {
-            commitment: 'confirmed',
-          }),
-          rpcUrl,
-        );
-
-        // Update this.config with Helius-specific fields so they're available throughout the class
-        this.config = mergedConfig;
-
-        // Initialize HeliusService with merged config (always use mergedConfig, not this.config)
-        // This ensures HeliusService gets all Helius fields even if this.config wasn't updated
-        this.heliusService = new HeliusService(mergedConfig);
-      } else {
-        // Fallback to standard nodeURL if no API key
-        logger.warn(`⚠️ Helius provider selected but no API key configured`);
-        logger.info(`Using standard RPC from nodeURL: ${this.config.nodeURL}`);
-        this.connection = createRateLimitAwareConnection(
+      // Validate API key
+      if (!apiKey || apiKey.trim() === '' || apiKey.includes('YOUR_')) {
+        logger.warn(`⚠️ Helius provider selected but no valid API key configured`);
+        logger.info(`Using standard RPC from nodeURL: ${redactUrl(this.config.nodeURL)}`);
+        this.connection = createRateLimitAwareSolanaConnection(
           new Connection(this.config.nodeURL, {
             commitment: 'confirmed',
           }),
           this.config.nodeURL,
         );
+        return;
       }
-    } catch (error) {
+
+      // Create HeliusService instance
+      this.rpcProviderService = new HeliusService(
+        { apiKey },
+        { chain: 'solana', network: this.network, chainId: this.config.chainID },
+      );
+
+      // Use Helius HTTP URL for connection
+      const rpcUrl = this.rpcProviderService.getHttpUrl();
+      logger.info(`Initializing Solana connector for network: ${this.network}, RPC URL: ${redactUrl(rpcUrl)}`);
+      logger.info(`✅ Helius API key configured (length: ${apiKey.length} chars)`);
+
+      this.connection = createRateLimitAwareSolanaConnection(
+        new Connection(rpcUrl, {
+          commitment: 'confirmed',
+        }),
+        rpcUrl,
+      );
+    } catch (error: any) {
       // If Helius config not found (e.g., in tests), fallback to standard RPC
       logger.warn(`Failed to initialize Helius provider: ${error.message}, falling back to standard RPC`);
-      this.connection = createRateLimitAwareConnection(
+      this.connection = createRateLimitAwareSolanaConnection(
         new Connection(this.config.nodeURL, {
           commitment: 'confirmed',
         }),
@@ -196,27 +150,19 @@ export class Solana {
     }
     if (!Solana._instances[network]) {
       const instance = new Solana(network);
-      await instance.init();
+      // Add to instances BEFORE init() to prevent creating duplicate instances
+      // during initialization (e.g., when trackPools calls connector getInstance)
       Solana._instances[network] = instance;
+      await instance.init();
     }
     return Solana._instances[network];
   }
 
   private async init(): Promise<void> {
     try {
-      logger.info(
-        `Initializing Solana connector for network: ${this.network}, RPC URL: ${this.connection.rpcEndpoint}`,
-      );
-      await this.loadTokens();
-
-      // Initialize Helius services only if using Helius provider
-      const chainConfig = getSolanaChainConfig();
-      const rpcProvider = chainConfig.rpcProvider || 'url';
-      if (rpcProvider === 'helius' && this.heliusService) {
-        logger.info(`Initializing Helius services for provider: ${rpcProvider}`);
-        await this.heliusService.initialize();
-      } else {
-        logger.info(`Using standard RPC provider: ${rpcProvider}`);
+      // Initialize RPC provider service if configured
+      if (this.rpcProviderService) {
+        await this.rpcProviderService.initialize();
       }
     } catch (e) {
       logger.error(`Failed to initialize ${this.network}: ${e}`);
@@ -224,45 +170,30 @@ export class Solana {
     }
   }
 
+  /**
+   * Get the token list from TokenService (reads from disk each time)
+   */
   async getTokenList(): Promise<TokenInfo[]> {
-    // Always return the stored list loaded via TokenService
-    return this.tokenList;
-  }
-
-  async loadTokens(): Promise<void> {
-    try {
-      // Use TokenService to load tokens
-      const tokens = await TokenService.getInstance().loadTokenList('solana', this.network);
-
-      // Convert to TokenInfo format (SPL token registry format)
-      this.tokenList = tokens.map((token) => ({
-        address: token.address,
-        symbol: token.symbol,
-        name: token.name,
-        decimals: token.decimals,
-        chainId: 101, // Solana mainnet chainId
-      }));
-
-      // Create symbol -> token mapping
-      this.tokenList.forEach((token: TokenInfo) => {
-        this._tokenMap[token.symbol] = token;
-      });
-
-      logger.info(`Loaded ${this.tokenList.length} tokens for solana/${this.network}`);
-    } catch (error) {
-      logger.error(`Failed to load token list for ${this.network}: ${error.message}`);
-      throw error;
-    }
+    const tokens = await TokenService.getInstance().loadTokenList('solana', this.network);
+    return tokens.map((token) => ({
+      address: token.address,
+      symbol: token.symbol,
+      name: token.name,
+      decimals: token.decimals,
+      chainId: 101, // Solana mainnet chainId
+    }));
   }
 
   async getToken(addressOrSymbol: string): Promise<TokenInfo | null> {
+    const tokenList = await this.getTokenList();
+
     // First try to find by symbol (case-insensitive)
     const normalizedSearch = addressOrSymbol.toUpperCase().trim();
-    let token = this.tokenList.find((token: TokenInfo) => token.symbol.toUpperCase().trim() === normalizedSearch);
+    let token = tokenList.find((token: TokenInfo) => token.symbol.toUpperCase().trim() === normalizedSearch);
 
     // If not found by symbol, try to find by address
     if (!token) {
-      token = this.tokenList.find((token: TokenInfo) => token.address.toLowerCase() === addressOrSymbol.toLowerCase());
+      token = tokenList.find((token: TokenInfo) => token.address.toLowerCase() === addressOrSymbol.toLowerCase());
     }
 
     // If still not found, try to create a new token assuming addressOrSymbol is an address
@@ -330,11 +261,11 @@ export class Solana {
       // Read the wallet file using the safe path
       const encryptedPrivateKey: string = await fse.readFile(safeWalletPath, 'utf8');
 
-      const passphrase = ConfigManagerCertPassphrase.readPassphrase();
-      if (!passphrase) {
-        throw new Error('missing passphrase');
+      const walletKey = ConfigManagerCertPassphrase.readWalletKey();
+      if (!walletKey) {
+        throw new Error('missing wallet encryption key');
       }
-      const decrypted = await this.decrypt(encryptedPrivateKey, passphrase);
+      const decrypted = await this.decrypt(encryptedPrivateKey, walletKey);
 
       return Keypair.fromSecretKey(new Uint8Array(bs58.decode(decrypted)));
     } catch (error) {
@@ -361,10 +292,10 @@ export class Solana {
   }
 
   /**
-   * Get the HeliusService instance if initialized
+   * Get the RPC provider service if initialized
    */
-  public getHeliusService(): HeliusService | null {
-    return this.heliusService || null;
+  public getRpcProviderService(): RPCProvider | null {
+    return this.rpcProviderService || null;
   }
 
   /**
@@ -428,6 +359,7 @@ export class Solana {
   async getBalance(wallet: Keypair, symbols?: string[]): Promise<Record<string, number>> {
     const publicKey = wallet.publicKey;
     const balances: Record<string, number> = {};
+    const tokenList = await this.getTokenList();
 
     // Treat empty array as if no tokens were specified
     const effectiveSymbols = symbols && symbols.length === 0 ? undefined : symbols;
@@ -445,16 +377,30 @@ export class Solana {
     }
 
     // Get all token accounts for the provided address using jsonParsed encoding
-    const [legacyAccounts, token2022Accounts] = await Promise.all([
-      this.connection.getParsedTokenAccountsByOwner(publicKey, {
-        programId: TOKEN_PROGRAM_ID,
-      }),
-      this.connection.getParsedTokenAccountsByOwner(publicKey, {
-        programId: TOKEN_2022_PROGRAM_ID,
-      }),
-    ]);
-
-    const allAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
+    let allAccounts = [];
+    try {
+      const [legacyAccounts, token2022Accounts] = await Promise.all([
+        this.connection.getParsedTokenAccountsByOwner(publicKey, {
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        this.connection.getParsedTokenAccountsByOwner(publicKey, {
+          programId: TOKEN_2022_PROGRAM_ID,
+        }),
+      ]);
+      allAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
+    } catch (error) {
+      // If we get a StructError (validation failure from mixed parsed/base64 responses),
+      // fall back to using base64 encoding
+      if (error.name === 'StructError' || error.message?.includes('Expected an object')) {
+        logger.warn('StructError in getBalance, falling back to base64 encoding');
+        // Use the base64 fallback method to get token accounts
+        const tokenAccountsMap = await this.fetchTokenAccountsBase64(publicKey);
+        // Convert the map to the array format expected by the rest of this method
+        allAccounts = Array.from(tokenAccountsMap.values()).map((ta) => ta.value);
+      } else {
+        throw error;
+      }
+    }
 
     // Track tokens that were found and those that still need to be fetched
     const foundTokens = new Set<string>();
@@ -494,7 +440,7 @@ export class Solana {
         }
 
         // Check if it's a token symbol in our list
-        const tokenBySymbol = this.tokenList.find((t) => t.symbol.toUpperCase() === s.toUpperCase());
+        const tokenBySymbol = tokenList.find((t) => t.symbol.toUpperCase() === s.toUpperCase());
 
         if (tokenBySymbol) {
           foundTokens.add(tokenBySymbol.symbol);
@@ -502,8 +448,9 @@ export class Solana {
           // Check if we have this token in the wallet
           if (mintToAccount.has(tokenBySymbol.address)) {
             const { parsedAccount } = mintToAccount.get(tokenBySymbol.address);
-            const amount = parsedAccount.amount;
-            const uiAmount = Number(amount) / Math.pow(10, tokenBySymbol.decimals);
+            // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+            const uiAmount =
+              parsedAccount.uiAmount ?? Number(parsedAccount.amount) / Math.pow(10, tokenBySymbol.decimals);
             balances[tokenBySymbol.symbol] = uiAmount;
             logger.debug(`Found balance for ${tokenBySymbol.symbol}: ${uiAmount}`);
           } else {
@@ -524,13 +471,13 @@ export class Solana {
               const { parsedAccount } = mintToAccount.get(mintAddress);
 
               // Try to get token from our token list
-              const token = this.tokenList.find((t) => t.address === mintAddress);
+              const token = tokenList.find((t) => t.address === mintAddress);
 
               if (token) {
                 // Token is in our list
                 foundTokens.add(token.symbol);
-                const amount = parsedAccount.amount;
-                const uiAmount = Number(amount) / Math.pow(10, token.decimals);
+                // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+                const uiAmount = parsedAccount.uiAmount ?? Number(parsedAccount.amount) / Math.pow(10, token.decimals);
                 balances[token.symbol] = uiAmount;
                 logger.debug(`Found balance for ${token.symbol} (${mintAddress}): ${uiAmount}`);
               } else {
@@ -551,10 +498,10 @@ export class Solana {
     } else {
       // No symbols provided or empty array - check all tokens in the token list
       // Note: When symbols is an empty array, we check all tokens in the token list
-      logger.info(`Checking balances for all ${this.tokenList.length} tokens in the token list`);
+      logger.info(`Checking balances for all ${tokenList.length} tokens in the token list`);
 
       // Process all tokens from the token list
-      for (const token of this.tokenList) {
+      for (const token of tokenList) {
         // Skip if already processed
         if (token.symbol === 'SOL' || foundTokens.has(token.symbol)) {
           continue;
@@ -563,8 +510,8 @@ export class Solana {
         // Check if we have this token in the wallet
         if (mintToAccount.has(token.address)) {
           const { parsedAccount } = mintToAccount.get(token.address);
-          const amount = parsedAccount.amount;
-          const uiAmount = Number(amount) / Math.pow(10, token.decimals);
+          // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+          const uiAmount = parsedAccount.uiAmount ?? Number(parsedAccount.amount) / Math.pow(10, token.decimals);
           balances[token.symbol] = uiAmount;
           logger.debug(`Found balance for ${token.symbol} (${token.address}): ${uiAmount}`);
         } else {
@@ -588,9 +535,8 @@ export class Solana {
           const mintInfo = await getMint(this.connection, parsedAccount.mint);
           decimals = mintInfo.decimals;
 
-          // Calculate balance
-          const amount = parsedAccount.amount;
-          balance = Number(amount) / Math.pow(10, decimals);
+          // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+          balance = parsedAccount.uiAmount ?? Number(parsedAccount.amount) / Math.pow(10, decimals);
         } else {
           // Try to get decimals anyway for the display
           try {
@@ -636,14 +582,107 @@ export class Solana {
    * Get balances for a given address
    * @param address Wallet address
    * @param tokens Optional array of token symbols/addresses to fetch. If not provided, fetches tokens from token list
-   * @param fetchAll If true, fetches all tokens in wallet including unknown ones
-   * @returns Map of token symbol to balance
+   * @returns Map of token symbol to balance (only includes tokens in network's token list)
    */
-  public async getBalances(
-    address: string,
-    tokens?: string[],
-    fetchAll: boolean = false,
-  ): Promise<Record<string, number>> {
+  public async getBalances(address: string, tokens?: string[]): Promise<Record<string, number>> {
+    return this.getBalancesFromRPC(address, tokens);
+  }
+
+  /**
+   * Fetch positions for a wallet from all connectors
+   * Uses connector-specific helpers to avoid duplicating logic
+   */
+  private async fetchPositionsForWallet(walletAddress: string): Promise<any[]> {
+    const allPositions: any[] = [];
+
+    // Try Meteora
+    try {
+      const { getPositionsOwned: getMeteoraPositions } = await import(
+        '../../connectors/meteora/clmm-routes/positionsOwned'
+      );
+      // Create a minimal fastify-like object for validation
+      const mockFastify = { httpErrors: { badRequest: (msg: string) => new Error(msg) } };
+      const meteoraPositions = await getMeteoraPositions(mockFastify as any, this.network, walletAddress);
+
+      // Add connector metadata to each position
+      for (const position of meteoraPositions) {
+        allPositions.push({
+          connector: 'meteora',
+          positionId: position.address,
+          poolAddress: position.poolAddress,
+          baseToken: position.baseTokenAddress,
+          quoteToken: position.quoteTokenAddress,
+          liquidity: position.baseTokenAmount + position.quoteTokenAmount,
+          ...position,
+        });
+      }
+      logger.debug(`Fetched ${meteoraPositions.length} Meteora position(s) for ${walletAddress.slice(0, 8)}...`);
+    } catch (error: any) {
+      logger.debug(`Could not fetch Meteora positions for ${walletAddress.slice(0, 8)}...: ${error.message}`);
+    }
+
+    // Try Raydium CLMM
+    try {
+      const { getPositionsOwned: getRaydiumPositions } = await import(
+        '../../connectors/raydium/clmm-routes/positionsOwned'
+      );
+      const mockFastify = { httpErrors: { badRequest: (msg: string) => new Error(msg) } };
+      const raydiumPositions = await getRaydiumPositions(mockFastify as any, this.network, walletAddress);
+
+      // Add connector metadata to each position
+      for (const position of raydiumPositions) {
+        allPositions.push({
+          connector: 'raydium',
+          positionId: position.address,
+          poolAddress: position.poolAddress,
+          baseToken: position.baseTokenAddress,
+          quoteToken: position.quoteTokenAddress,
+          liquidity: position.baseTokenAmount + position.quoteTokenAmount,
+          ...position,
+        });
+      }
+      logger.debug(`Fetched ${raydiumPositions.length} Raydium position(s) for ${walletAddress.slice(0, 8)}...`);
+    } catch (error: any) {
+      logger.debug(`Could not fetch Raydium positions for ${walletAddress.slice(0, 8)}...: ${error.message}`);
+    }
+
+    // Try PancakeSwap
+    try {
+      const { getPositionsOwned: getPancakeswapPositions } = await import(
+        '../../connectors/pancakeswap-sol/clmm-routes/positionsOwned'
+      );
+      const mockFastify = { httpErrors: { badRequest: (msg: string) => new Error(msg) } };
+      const pancakeswapPositions = await getPancakeswapPositions(mockFastify as any, this.network, walletAddress);
+
+      // Add connector metadata to each position
+      for (const position of pancakeswapPositions) {
+        allPositions.push({
+          connector: 'pancakeswap-sol',
+          positionId: position.address,
+          poolAddress: position.poolAddress,
+          baseToken: position.baseTokenAddress,
+          quoteToken: position.quoteTokenAddress,
+          liquidity: position.baseTokenAmount + position.quoteTokenAmount,
+          ...position,
+        });
+      }
+      logger.debug(
+        `Fetched ${pancakeswapPositions.length} PancakeSwap position(s) for ${walletAddress.slice(0, 8)}...`,
+      );
+    } catch (error: any) {
+      logger.debug(`Could not fetch PancakeSwap positions for ${walletAddress.slice(0, 8)}...: ${error.message}`);
+    }
+
+    return allPositions;
+  }
+
+  /**
+   * Get balances for a given address directly from RPC (bypasses cache)
+   * @param address Wallet address
+   * @param tokens Optional array of token symbols/addresses to fetch. If not provided, fetches tokens from token list
+   * @returns Map of token symbol to balance (only includes tokens in network's token list)
+   */
+  private async getBalancesFromRPC(address: string, tokens?: string[]): Promise<Record<string, number>> {
     const publicKey = new PublicKey(address);
     const balances: Record<string, number> = {};
 
@@ -675,9 +714,6 @@ export class Solana {
     if (effectiveSymbols) {
       // Specific tokens requested
       await this.processSpecificTokens(tokenAccounts, effectiveSymbols, balances);
-    } else if (fetchAll) {
-      // Fetch all tokens in wallet
-      await this.processAllTokens(tokenAccounts, balances);
     } else {
       // Default: only tokens in token list
       await this.processTokenListOnly(tokenAccounts, balances);
@@ -711,72 +747,142 @@ export class Solana {
   }
 
   /**
-   * Fetch all token accounts for a public key using jsonParsed encoding for efficiency
+   * Fetch all token accounts for a public key
+   * Always uses base64 encoding for reliability across all RPC providers (Helius, standard RPC)
    */
   private async fetchTokenAccounts(publicKey: PublicKey): Promise<Map<string, TokenAccount>> {
     const tokenAccountsMap = new Map<string, TokenAccount>();
+    const tokenList = await this.getTokenList();
 
     try {
-      // Use getParsedTokenAccountsByOwner - Helius optimization technique
-      // This returns pre-parsed data, avoiding manual unpacking
-      const tokenAccountsPromise = Promise.all([
-        this.connection.getParsedTokenAccountsByOwner(publicKey, {
+      // Fetch all accounts with base64 encoding - works reliably for all providers
+      const [legacyBase64, token2022Base64] = await Promise.all([
+        this.connection.getTokenAccountsByOwner(publicKey, {
           programId: TOKEN_PROGRAM_ID,
         }),
-        this.connection.getParsedTokenAccountsByOwner(publicKey, {
+        this.connection.getTokenAccountsByOwner(publicKey, {
           programId: TOKEN_2022_PROGRAM_ID,
         }),
       ]);
 
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('Token accounts request timed out')), 10000);
-      });
+      const allBase64Accounts = [...legacyBase64.value, ...token2022Base64.value];
+      logger.info(`Found ${allBase64Accounts.length} token accounts for ${publicKey.toString()}`);
 
-      const [legacyAccounts, token2022Accounts] = (await Promise.race([tokenAccountsPromise, timeoutPromise])) as any;
-
-      const allAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
-      logger.info(`Found ${allAccounts.length} token accounts for ${publicKey.toString()}`);
-
-      // With getParsedTokenAccountsByOwner, data is already structured - no unpacking needed
-      for (const account of allAccounts) {
+      for (const account of allBase64Accounts) {
         try {
-          const parsedInfo = account.account.data.parsed?.info;
-          if (!parsedInfo) {
-            logger.warn('Account data not parsed or missing info');
+          // Convert Buffer to Uint8Array for AccountLayout.decode
+          const data = new Uint8Array(account.account.data);
+          const accountInfo = AccountLayout.decode(data);
+          const mintAddress = accountInfo.mint.toString();
+
+          // Get decimals from token list (only process tokens in our list)
+          const tokenInList = tokenList.find((t) => t.address === mintAddress);
+          if (!tokenInList) {
+            // Skip tokens not in our token list
+            logger.debug(`Skipping token ${mintAddress} - not in token list`);
             continue;
           }
-          const mintAddress = parsedInfo.mint;
 
-          // Store in format compatible with existing code
+          // Store in the same format as parsed accounts
           tokenAccountsMap.set(mintAddress, {
             parsedAccount: {
-              mint: new PublicKey(mintAddress),
-              owner: new PublicKey(parsedInfo.owner),
-              amount: BigInt(parsedInfo.tokenAmount.amount),
-              decimals: parsedInfo.tokenAmount.decimals,
-              isNative: parsedInfo.isNative || false,
-              delegatedAmount: parsedInfo.delegatedAmount ? BigInt(parsedInfo.delegatedAmount.amount) : BigInt(0),
-              delegate: parsedInfo.delegate ? new PublicKey(parsedInfo.delegate) : null,
-              state: parsedInfo.state,
-              isInitialized: parsedInfo.state !== 'uninitialized',
-              isFrozen: parsedInfo.state === 'frozen',
-              rentExemptReserve: parsedInfo.isNative ? BigInt(parsedInfo.isNative) : null,
-              closeAuthority: parsedInfo.closeAuthority ? new PublicKey(parsedInfo.closeAuthority) : null,
+              mint: accountInfo.mint,
+              owner: accountInfo.owner,
+              amount: accountInfo.amount,
+              decimals: tokenInList.decimals,
+              uiAmount: Number(accountInfo.amount) / Math.pow(10, tokenInList.decimals),
+              isNative: accountInfo.isNative !== null && accountInfo.isNativeOption === 1,
+              delegatedAmount: accountInfo.delegateOption ? accountInfo.delegatedAmount : BigInt(0),
+              delegate: accountInfo.delegateOption ? accountInfo.delegate : null,
+              state: accountInfo.state === 1 ? 'initialized' : accountInfo.state === 2 ? 'frozen' : 'uninitialized',
+              isInitialized: accountInfo.state !== 0,
+              isFrozen: accountInfo.state === 2,
+              rentExemptReserve: accountInfo.isNative,
+              closeAuthority: accountInfo.closeAuthorityOption ? accountInfo.closeAuthority : null,
             },
             value: account,
           });
-        } catch (error) {
-          logger.warn(`Error processing parsed account: ${error.message}`);
+        } catch (decodeError) {
+          logger.warn(`Error decoding base64 account: ${decodeError.message}`);
         }
       }
     } catch (error) {
-      logger.error(`Error fetching token accounts: ${error.message}`);
+      logger.error(`Error fetching token accounts with parsed encoding: ${error.message}`);
 
       // Re-throw rate limit errors (statusCode 429) so they propagate to the API response
       if (error.statusCode === 429) {
         throw error;
       }
+
+      // If we get a StructError (validation failure from mixed parsed/base64 responses),
+      // fall back to using base64 encoding exclusively
+      if (error.name === 'StructError' || error.message?.includes('Expected an object')) {
+        logger.warn('Falling back to base64 encoding due to mixed response format');
+        return await this.fetchTokenAccountsBase64(publicKey);
+      }
       // For other errors, log but don't fail the request (return empty map)
+    }
+
+    return tokenAccountsMap;
+  }
+
+  /**
+   * Fallback method to fetch token accounts using base64 encoding
+   * Used when getParsedTokenAccountsByOwner returns mixed parsed/base64 data
+   */
+  private async fetchTokenAccountsBase64(publicKey: PublicKey): Promise<Map<string, TokenAccount>> {
+    const tokenAccountsMap = new Map<string, TokenAccount>();
+    const { AccountLayout } = await import('@solana/spl-token');
+
+    try {
+      const [legacyAccounts, token2022Accounts] = await Promise.all([
+        this.connection.getTokenAccountsByOwner(publicKey, {
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        this.connection.getTokenAccountsByOwner(publicKey, {
+          programId: TOKEN_2022_PROGRAM_ID,
+        }),
+      ]);
+
+      const allAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
+      logger.info(`Found ${allAccounts.length} token accounts (base64) for ${publicKey.toString()}`);
+
+      for (const account of allAccounts) {
+        try {
+          // Decode base64 account data using AccountLayout
+          // Convert Buffer to Uint8Array for AccountLayout.decode
+          const data =
+            account.account.data instanceof Buffer ? Uint8Array.from(account.account.data) : account.account.data;
+          const accountData = AccountLayout.decode(data);
+          const mintAddress = accountData.mint.toString();
+
+          tokenAccountsMap.set(mintAddress, {
+            parsedAccount: {
+              mint: accountData.mint,
+              owner: accountData.owner,
+              amount: accountData.amount,
+              decimals: 0, // Will be fetched from mint if needed
+              isNative: accountData.isNativeOption === 1,
+              delegatedAmount: accountData.delegatedAmount,
+              delegate: accountData.delegateOption === 1 ? accountData.delegate : null,
+              state: accountData.state === 1 ? 'initialized' : 'uninitialized',
+              isInitialized: accountData.state === 1,
+              isFrozen: accountData.state === 2,
+              rentExemptReserve: accountData.isNativeOption === 1 ? accountData.isNative : null,
+              closeAuthority: accountData.closeAuthorityOption === 1 ? accountData.closeAuthority : null,
+            },
+            value: account,
+          });
+        } catch (error) {
+          logger.warn(`Error decoding base64 account: ${error.message}`);
+        }
+      }
+    } catch (error) {
+      logger.error(`Error fetching token accounts with base64 encoding: ${error.message}`);
+
+      if (error.statusCode === 429) {
+        throw error;
+      }
     }
 
     return tokenAccountsMap;
@@ -810,11 +916,13 @@ export class Solana {
     balances: Record<string, number>,
   ): Promise<void> {
     const SOL_NATIVE_MINT = 'So11111111111111111111111111111111111111112';
+    const tokenList = await this.getTokenList();
+
     for (const symbol of symbols) {
       if (symbol.toUpperCase() === 'SOL' || symbol === SOL_NATIVE_MINT) continue;
 
       // Try to find token by symbol
-      const tokenInfo = this.tokenList.find((t) => t.symbol.toUpperCase() === symbol.toUpperCase());
+      const tokenInfo = tokenList.find((t) => t.symbol.toUpperCase() === symbol.toUpperCase());
 
       if (tokenInfo) {
         // Token found in list
@@ -844,11 +952,12 @@ export class Solana {
     balances: Record<string, number>,
   ): Promise<void> {
     logger.info('Processing all token accounts (fetchAll=true)');
+    const tokenList = await this.getTokenList();
 
     for (const [mintAddress, tokenAccount] of tokenAccounts) {
       try {
         // Check if token is in our list
-        const tokenInfo = this.tokenList.find((t) => t.address === mintAddress);
+        const tokenInfo = tokenList.find((t) => t.address === mintAddress);
 
         if (tokenInfo) {
           const balance = this.getTokenBalance(tokenAccount, tokenInfo.decimals);
@@ -873,9 +982,10 @@ export class Solana {
     tokenAccounts: Map<string, TokenAccount>,
     balances: Record<string, number>,
   ): Promise<void> {
-    logger.info(`Checking balances for ${this.tokenList.length} tokens in token list`);
+    const tokenList = await this.getTokenList();
+    logger.info(`Checking balances for ${tokenList.length} tokens in token list`);
 
-    for (const tokenInfo of this.tokenList) {
+    for (const tokenInfo of tokenList) {
       if (tokenInfo.symbol === 'SOL') continue;
 
       const tokenAccount = tokenAccounts.get(tokenInfo.address);
@@ -894,8 +1004,8 @@ export class Solana {
   private getTokenBalance(tokenAccount: TokenAccount | undefined, decimals: number): number {
     if (!tokenAccount) return 0;
 
-    const amount = tokenAccount.parsedAccount.amount;
-    return Number(amount) / Math.pow(10, decimals);
+    // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+    return tokenAccount.parsedAccount.uiAmount ?? Number(tokenAccount.parsedAccount.amount) / Math.pow(10, decimals);
   }
 
   /**
@@ -909,13 +1019,16 @@ export class Solana {
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Mint info timeout')), 1000)),
       ]);
 
-      const amount = tokenAccount.parsedAccount.amount;
-      return Number(amount) / Math.pow(10, mintInfo.decimals);
+      // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+      return (
+        tokenAccount.parsedAccount.uiAmount ??
+        Number(tokenAccount.parsedAccount.amount) / Math.pow(10, mintInfo.decimals)
+      );
     } catch (error) {
       // Use default 9 decimals if mint info fails
       logger.debug(`Failed to get mint info for ${mintAddress}, using default decimals`);
-      const amount = tokenAccount.parsedAccount.amount;
-      return Number(amount) / Math.pow(10, 9);
+      // Use pre-calculated uiAmount from RPC for efficiency (Helius optimization)
+      return tokenAccount.parsedAccount.uiAmount ?? Number(tokenAccount.parsedAccount.amount) / Math.pow(10, 9);
     }
   }
 
@@ -1031,10 +1144,10 @@ export class Solana {
     timeout: number = 3000,
   ): Promise<{ confirmed: boolean; txData?: any }> {
     try {
-      // Use Helius WebSocket monitoring if available for real-time confirmation
-      if (this.heliusService.isWebSocketConnected()) {
+      // Use RPC provider WebSocket monitoring if available for real-time confirmation
+      if (this.rpcProviderService?.supportsTransactionMonitoring()) {
         logger.info(`Using WebSocket monitoring for transaction ${signature}`);
-        return await this.heliusService.monitorTransaction(signature, timeout);
+        return await this.rpcProviderService.monitorTransaction(signature, timeout);
       }
 
       // Fallback to polling-based confirmation
@@ -1082,8 +1195,59 @@ export class Solana {
     if (!txData?.meta) {
       return 0;
     }
-    // Convert fee from lamports to SOL
-    return (txData.meta.fee || 0) * LAMPORT_TO_SOL;
+
+    // Base fee from meta (in lamports)
+    const baseFee = txData.meta.fee || 0;
+
+    // Extract priority fee from compute budget instructions
+    let priorityFee = 0;
+    try {
+      const computeBudgetProgramId = 'ComputeBudget111111111111111111111111111111';
+      const instructions = txData.transaction?.message?.instructions || [];
+      const accountKeys = txData.transaction?.message?.accountKeys || [];
+
+      // Find SetComputeUnitPrice instruction
+      for (const ix of instructions) {
+        const programId = accountKeys[ix.programIdIndex]?.toString() || accountKeys[ix.programIdIndex];
+
+        if (programId === computeBudgetProgramId && ix.data) {
+          // Decode base58 instruction data
+          const data = typeof ix.data === 'string' ? bs58.decode(ix.data) : ix.data;
+
+          // SetComputeUnitPrice instruction has discriminator [3] and u64 microLamports
+          if (data.length >= 9 && data[0] === 3) {
+            // Read u64 little-endian (microlamports per CU)
+            const microLamportsPerCU =
+              data[1] |
+              (data[2] << 8) |
+              (data[3] << 16) |
+              (data[4] << 24) |
+              (data[5] << 32) |
+              (data[6] << 40) |
+              (data[7] << 48) |
+              (data[8] << 56);
+
+            // Priority fee = (microlamports per CU) * (CUs consumed) / 1,000,000
+            const computeUnitsConsumed = txData.meta.computeUnitsConsumed || 0;
+            priorityFee = Math.floor((microLamportsPerCU * computeUnitsConsumed) / 1_000_000);
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn(`Failed to extract priority fee: ${error.message}`);
+    }
+
+    // Total fee = base fee + priority fee (convert to SOL)
+    const totalFee = (baseFee + priorityFee) * LAMPORT_TO_SOL;
+
+    if (priorityFee > 0) {
+      logger.info(
+        `Transaction fees: base=${baseFee} lamports, priority=${priorityFee} lamports, total=${baseFee + priorityFee} lamports (${totalFee.toFixed(9)} SOL)`,
+      );
+    }
+
+    return totalFee;
   }
 
   public async sendAndConfirmTransaction(
@@ -1314,113 +1478,6 @@ export class Solana {
     return modifiedTx;
   }
 
-  /**
-   * Add Jito tip instruction to a VersionedTransaction for Helius Sender
-   */
-  private async addJitoTipToTransaction(
-    transaction: VersionedTransaction,
-    payerPublicKey: PublicKey,
-  ): Promise<VersionedTransaction> {
-    if (!this.heliusConfig.useHeliusSender || !this.heliusConfig.jitoTipSOL) {
-      return transaction;
-    }
-
-    const tipAmount = Math.floor(this.heliusConfig.jitoTipSOL * LAMPORTS_PER_SOL);
-    const randomTipAccount = JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)];
-
-    // Validate tip account
-    if (!randomTipAccount || typeof randomTipAccount !== 'string') {
-      throw new Error(`Invalid tip account selected: ${randomTipAccount}`);
-    }
-
-    // Create tip instruction
-    let tipAccountKey: PublicKey;
-    try {
-      tipAccountKey = new PublicKey(randomTipAccount);
-    } catch (error: any) {
-      throw new Error(`Failed to create PublicKey for tip account ${randomTipAccount}: ${error.message}`);
-    }
-
-    const tipInstruction = SystemProgram.transfer({
-      fromPubkey: payerPublicKey,
-      toPubkey: tipAccountKey,
-      lamports: tipAmount,
-    });
-
-    const originalMessage = transaction.message;
-    const originalStaticCount = originalMessage.staticAccountKeys.length;
-
-    // Add SystemProgram to static keys if not already present
-    const newStaticKeys = [...originalMessage.staticAccountKeys];
-    const systemProgramIndex = newStaticKeys.findIndex((key) => key.equals(SystemProgram.programId));
-
-    if (systemProgramIndex === -1) {
-      newStaticKeys.push(SystemProgram.programId);
-    }
-
-    // Add payer to static keys if not already present
-    const payerIndex = newStaticKeys.findIndex((key) => key.equals(payerPublicKey));
-    if (payerIndex === -1) {
-      newStaticKeys.push(payerPublicKey);
-    }
-
-    // Add tip account to static keys if not already present
-    const tipAccountIndex = newStaticKeys.findIndex((key) => key.equals(tipAccountKey));
-
-    if (tipAccountIndex === -1) {
-      newStaticKeys.push(tipAccountKey);
-    }
-
-    // Process original instructions with index adjustment
-    const indexOffset = newStaticKeys.length - originalStaticCount;
-    const originalInstructions = originalMessage.compiledInstructions.map((ix) => ({
-      ...ix,
-      accountKeyIndexes: ix.accountKeyIndexes.map((index) =>
-        index >= originalStaticCount ? index + indexOffset : index,
-      ),
-    }));
-
-    // Create tip instruction - find final indexes after all accounts are added
-    const finalPayerIndex = newStaticKeys.findIndex((key) => key.equals(payerPublicKey));
-    const finalTipAccountIdx = newStaticKeys.findIndex((key) => key.equals(tipAccountKey));
-    const finalSystemProgramIdx = newStaticKeys.findIndex((key) => key.equals(SystemProgram.programId));
-
-    const tipInstructionCompiled = {
-      programIdIndex: finalSystemProgramIdx,
-      accountKeyIndexes: [
-        finalPayerIndex, // from
-        finalTipAccountIdx, // to
-      ],
-      data: tipInstruction.data instanceof Buffer ? new Uint8Array(tipInstruction.data) : tipInstruction.data,
-    };
-
-    // Combine all instructions (tip instruction first)
-    const allInstructions = [tipInstructionCompiled, ...originalInstructions];
-
-    // Create new transaction with tip instruction
-    const modifiedTx = new VersionedTransaction(
-      new MessageV0({
-        header: originalMessage.header,
-        staticAccountKeys: newStaticKeys,
-        recentBlockhash: originalMessage.recentBlockhash,
-        compiledInstructions: allInstructions.map((ix) => ({
-          programIdIndex: ix.programIdIndex,
-          accountKeyIndexes: ix.accountKeyIndexes,
-          data: ix.data instanceof Buffer ? new Uint8Array(ix.data) : ix.data,
-        })),
-        addressTableLookups: originalMessage.addressTableLookups,
-      }),
-    );
-
-    // Copy original signatures - transaction will need to be re-signed by caller
-    modifiedTx.signatures = [...transaction.signatures];
-
-    logger.info(
-      `Jito tip transaction created successfully with ${modifiedTx.message.staticAccountKeys.length} accounts`,
-    );
-    return modifiedTx;
-  }
-
   async sendAndConfirmRawTransaction(
     transaction: VersionedTransaction | Transaction,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
@@ -1436,153 +1493,124 @@ export class Solana {
       return this._sendAndConfirmRawTransaction(serializedTx);
     }
 
-    // For VersionedTransaction, add Jito tip if using Helius Sender
-    let finalTransaction = transaction;
-    if (this.heliusConfig.useHeliusSender && this.heliusConfig.jitoTipSOL && this.heliusConfig.jitoTipSOL > 0) {
-      // Extract payer from the transaction
-      const payer = transaction.message.staticAccountKeys[0]; // First account is always the payer
-      finalTransaction = await this.addJitoTipToTransaction(transaction, payer);
-    }
-
-    // Serialize the final transaction
-    const serializedTx = finalTransaction.serialize();
+    // For VersionedTransaction, serialize directly
+    const serializedTx = transaction.serialize();
     return this._sendAndConfirmRawTransaction(serializedTx);
   }
 
-  // Create a private method to handle the actual sending with Helius best practices
+  /**
+   * Confirm transaction via WebSocket monitoring
+   */
+  private async _confirmViaWebSocket(signature: string): Promise<{ confirmed: boolean; txData: any } | null> {
+    if (!this.rpcProviderService?.supportsTransactionMonitoring()) {
+      return null;
+    }
+
+    try {
+      logger.info(`🚀 Sent transaction ${signature}, monitoring via WebSocket...`);
+      const confirmationResult = await this.rpcProviderService.monitorTransaction(signature, 60000);
+
+      if (confirmationResult.confirmed) {
+        logger.info(`✅ Transaction ${signature} confirmed via WebSocket`);
+        const txData = await this.connection.getTransaction(signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        });
+        return { confirmed: true, txData };
+      } else {
+        logger.warn(`❌ Transaction ${signature} not confirmed via WebSocket within timeout`);
+        return { confirmed: false, txData: null };
+      }
+    } catch (wsError: any) {
+      logger.warn(`WebSocket monitoring failed: ${wsError.message}, falling back to polling`);
+      return null;
+    }
+  }
+
+  /**
+   * Confirm transaction via REST polling
+   */
+  private async _confirmViaPolling(
+    signature: string,
+    lastValidBlockHeight: number,
+  ): Promise<{ confirmed: boolean; txData: any }> {
+    logger.info(`🚀 Sent transaction ${signature}, polling for confirmation...`);
+
+    let attempts = 0;
+
+    while (attempts < this.config.confirmRetryCount) {
+      attempts++;
+
+      try {
+        const statuses = await this.connection.getSignatureStatuses([signature]);
+        const status = statuses && statuses.value && statuses.value[0];
+
+        if (status) {
+          if (status.err) {
+            logger.error(`❌ Transaction ${signature} failed with error:`, status.err);
+            return { confirmed: false, txData: null };
+          }
+
+          if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+            logger.info(`✅ Transaction ${signature} confirmed after ${attempts} attempts`);
+            const txData = await this.connection.getTransaction(signature, {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0,
+            });
+            return { confirmed: true, txData };
+          }
+        }
+
+        // Check if blockhash has expired
+        const currentBlockHeight = await this.connection.getBlockHeight();
+        if (currentBlockHeight > lastValidBlockHeight) {
+          logger.warn(`Blockhash expired for transaction ${signature}, transaction may have failed`);
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, this.config.confirmRetryInterval * 1000));
+      } catch (pollingError: any) {
+        if (pollingError.statusCode === 429) {
+          logger.error(`Rate limit error while polling transaction ${signature}`);
+          throw pollingError;
+        }
+        logger.warn(`Polling attempt ${attempts} failed: ${pollingError.message}`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    logger.warn(`❌ Transaction ${signature} not confirmed after ${attempts} attempts`);
+    return { confirmed: false, txData: null };
+  }
+
+  /**
+   * Send and confirm a raw transaction
+   */
   private async _sendAndConfirmRawTransaction(
     serializedTx: Buffer | Uint8Array,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
-    // Get latest blockhash for expiration checking
     const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
 
     let signature: string | null = null;
 
     try {
-      // Use Helius Sender if available, otherwise use standard RPC
-      if (this.heliusService) {
-        try {
-          signature = await this.heliusService.sendWithSender(serializedTx);
-          logger.info('Using Helius Sender for optimized transaction delivery');
-        } catch (error) {
-          // Helius Sender not enabled/configured - use standard sendRawTransaction via Helius RPC
-          const chainConfig = getSolanaChainConfig();
-          const rpcProvider = chainConfig.rpcProvider || 'url';
-          if (rpcProvider === 'helius') {
-            logger.info('Using standard sendRawTransaction via Helius RPC (Sender disabled)');
-          } else {
-            logger.info('Using standard sendRawTransaction');
-          }
-          signature = await this.connection.sendRawTransaction(serializedTx, {
-            skipPreflight: true,
-            maxRetries: 0, // Don't rely on RPC provider's retry logic
-          });
-        }
-      } else {
-        // No Helius service, use standard RPC
-        logger.info('Using standard sendRawTransaction');
-        signature = await this.connection.sendRawTransaction(serializedTx, {
-          skipPreflight: true,
-          maxRetries: 0,
-        });
+      logger.info('Sending transaction via sendRawTransaction');
+      signature = await this.connection.sendRawTransaction(serializedTx, {
+        skipPreflight: true,
+        maxRetries: 0,
+      });
+
+      // Try WebSocket first, fall back to polling
+      const wsResult = await this._confirmViaWebSocket(signature);
+      if (wsResult !== null) {
+        return { ...wsResult, signature };
       }
 
-      // Use WebSocket monitoring if available, otherwise fall back to robust polling
-      if (this.heliusService && this.heliusService.isWebSocketConnected()) {
-        logger.info(`🚀 Sent transaction ${signature}, monitoring via WebSocket...`);
-        const confirmationResult = await this.heliusService.monitorTransaction(signature, 60000);
-
-        if (confirmationResult.confirmed) {
-          logger.info(`✅ Transaction ${signature} confirmed via WebSocket`);
-          return { confirmed: true, signature, txData: confirmationResult.txData };
-        } else {
-          logger.warn(`❌ Transaction ${signature} not confirmed via WebSocket within timeout`);
-          return { confirmed: false, signature, txData: confirmationResult.txData };
-        }
-      }
-
-      logger.info(`🚀 Sent transaction ${signature}, implementing robust polling confirmation...`);
-
-      // Implement robust polling mechanism as per Helius best practices
-      const confirmed = false;
-      let attempts = 0;
-      const maxPollingAttempts = 30; // 30 attempts * 2s = 60s total timeout
-
-      while (!confirmed && attempts < maxPollingAttempts) {
-        attempts++;
-
-        try {
-          // Check signature status
-          const statuses = await this.connection.getSignatureStatuses([signature]);
-          const status = statuses && statuses.value && statuses.value[0];
-
-          if (status) {
-            if (status.err) {
-              logger.error(`❌ Transaction ${signature} failed with error:`, status.err);
-              return { confirmed: false, signature, txData: null };
-            }
-
-            if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
-              logger.info(`✅ Transaction ${signature} confirmed after ${attempts} attempts`);
-
-              // Get full transaction data
-              const txData = await this.connection.getTransaction(signature, {
-                commitment: 'confirmed',
-                maxSupportedTransactionVersion: 0,
-              });
-
-              return { confirmed: true, signature, txData };
-            }
-          }
-
-          // Check if blockhash has expired
-          const currentBlockHeight = await this.connection.getBlockHeight();
-          if (currentBlockHeight > lastValidBlockHeight) {
-            logger.warn(`Blockhash expired for transaction ${signature}, re-broadcasting...`);
-
-            // Re-broadcast the same transaction (don't re-sign with same blockhash)
-            try {
-              await this.connection.sendRawTransaction(serializedTx, {
-                skipPreflight: true,
-                maxRetries: 0,
-              });
-              logger.info(`Re-broadcasted transaction ${signature}`);
-            } catch (rebroadcastError: any) {
-              // Re-throw rate limit errors immediately
-              if (rebroadcastError.statusCode === 429) {
-                logger.error(`Rate limit error while re-broadcasting transaction ${signature}`);
-                throw rebroadcastError;
-              }
-
-              logger.warn(`Failed to re-broadcast: ${rebroadcastError.message}`);
-            }
-
-            // Continue polling with original signature
-          }
-
-          // Wait before next poll
-          await new Promise((resolve) => setTimeout(resolve, this.config.confirmRetryInterval * 1000));
-        } catch (pollingError: any) {
-          // Re-throw rate limit errors immediately
-          if (pollingError.statusCode === 429) {
-            logger.error(`Rate limit error while polling transaction ${signature}`);
-            throw pollingError;
-          }
-
-          logger.warn(`Polling attempt ${attempts} failed: ${pollingError.message}`);
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-      }
-
-      // If we exit the loop without confirmation
-      logger.warn(`❌ Transaction ${signature} not confirmed after ${attempts} attempts`);
-      return { confirmed: false, signature, txData: null };
+      const pollingResult = await this._confirmViaPolling(signature, lastValidBlockHeight);
+      return { ...pollingResult, signature };
     } catch (sendError: any) {
-      // Re-throw rate limit errors
       if (sendError.statusCode === 429) {
         throw sendError;
       }
-
       logger.error(`Failed to send transaction: ${sendError.message}`);
       return { confirmed: false, signature: signature || '', txData: null };
     }
@@ -1634,8 +1662,8 @@ export class Solana {
       throw new Error(`Transaction ${signature} not found`);
     }
 
-    // Calculate fee (always in SOL)
-    const fee = (txDetails.meta?.fee || 0) * LAMPORT_TO_SOL;
+    // Calculate fee including priority fee using the same method as getFee
+    const fee = this.getFee(txDetails);
 
     const preBalances = txDetails.meta?.preBalances || [];
     const postBalances = txDetails.meta?.postBalances || [];
@@ -1848,6 +1876,15 @@ export class Solana {
 
       // Known program-specific messages
       if (
+        errorMessage.includes('Error Code: InvalidPositionWidth') ||
+        errorMessage.includes('custom program error: 0x1798')
+      ) {
+        throw asBadRequest(
+          'Error Code: InvalidPositionWidth. Error Number: 6040. Error Message: Invalid position width. ' +
+            'Please use a position width of 69 bins or lower.',
+        );
+      }
+      if (
         errorMessage.includes('Error Code: PriceSlippageCheck') ||
         errorMessage.includes('custom program error: 0x1785')
       ) {
@@ -2006,18 +2043,37 @@ export class Solana {
    * @param walletPubkey Wallet public key
    * @param amount Amount of SOL to wrap in lamports
    * @param tokenProgram Token program (default TOKEN_PROGRAM_ID)
-   * @returns Array of instructions to wrap SOL
+   * @param checkBalance If true, only wrap the difference between required amount and existing WSOL balance
+   * @returns Array of instructions to wrap SOL (empty if balance is sufficient when checkBalance is true)
    */
   public async wrapSOL(
     walletPubkey: PublicKey,
     amount: number,
     tokenProgram: PublicKey = TOKEN_PROGRAM_ID,
+    checkBalance: boolean = false,
   ): Promise<TransactionInstruction[]> {
     const instructions: TransactionInstruction[] = [];
     const wsolAccount = getAssociatedTokenAddressSync(NATIVE_MINT, walletPubkey, false, tokenProgram);
 
     // Check if WSOL account exists
     const accountInfo = await this.connection.getAccountInfo(wsolAccount);
+
+    let amountToWrap = amount;
+
+    if (checkBalance && accountInfo) {
+      // Smart balance checking: only wrap the difference
+      const accountData = AccountLayout.decode(new Uint8Array(accountInfo.data));
+      const existingBalance = Number(accountData.amount);
+      amountToWrap = Math.max(0, amount - existingBalance);
+
+      if (amountToWrap === 0) {
+        logger.info(`WSOL: existing balance ${existingBalance} lamports is sufficient for ${amount} lamports`);
+        return instructions; // Empty, no wrapping needed
+      }
+      logger.info(
+        `WSOL: existing balance ${existingBalance} lamports, wrapping ${amountToWrap} more for ${amount} total`,
+      );
+    }
 
     if (!accountInfo) {
       instructions.push(
@@ -2030,7 +2086,7 @@ export class Solana {
       SystemProgram.transfer({
         fromPubkey: walletPubkey,
         toPubkey: wsolAccount,
-        lamports: amount,
+        lamports: amountToWrap,
       }),
     );
     instructions.push(createSyncNativeInstruction(wsolAccount, tokenProgram));
@@ -2050,12 +2106,12 @@ export class Solana {
   }
 
   /**
-   * Clean up resources including WebSocket connections and connection warming
+   * Clean up resources including WebSocket connections
    */
   public disconnect(): void {
-    if (this.heliusService) {
-      this.heliusService.disconnect();
-      logger.info('Helius services disconnected and cleaned up');
+    if (this.rpcProviderService) {
+      this.rpcProviderService.disconnect();
+      logger.info(`${this.rpcProviderService.getProviderName()} disconnected and cleaned up`);
     }
   }
 

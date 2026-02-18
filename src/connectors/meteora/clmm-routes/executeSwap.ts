@@ -1,10 +1,11 @@
 import { SwapQuoteExactOut, SwapQuote } from '@meteora-ag/dlmm';
 import { PublicKey } from '@solana/web3.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { getSolanaChainConfig } from '../../../chains/solana/solana.config';
 import { ExecuteSwapResponseType, ExecuteSwapResponse } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
 import { Meteora } from '../meteora';
@@ -14,7 +15,6 @@ import { MeteoraClmmExecuteSwapRequest, MeteoraClmmExecuteSwapRequestType } from
 import { getRawSwapQuote } from './quoteSwap';
 
 export async function executeSwap(
-  fastify: FastifyInstance,
   network: string,
   address: string,
   baseTokenIdentifier: string,
@@ -22,10 +22,9 @@ export async function executeSwap(
   amount: number,
   side: 'BUY' | 'SELL',
   poolAddress: string,
-  slippagePct?: number,
+  slippagePct: number = MeteoraConfig.config.slippagePct,
 ): Promise<ExecuteSwapResponseType> {
   const solana = await Solana.getInstance(network);
-  const meteora = await Meteora.getInstance(network);
   const wallet = await solana.getWallet(address);
 
   const {
@@ -34,16 +33,7 @@ export async function executeSwap(
     swapAmount,
     quote: swapQuote,
     dlmmPool,
-  } = await getRawSwapQuote(
-    fastify,
-    network,
-    baseTokenIdentifier,
-    quoteTokenIdentifier,
-    amount,
-    side,
-    poolAddress,
-    slippagePct || MeteoraConfig.config.slippagePct,
-  );
+  } = await getRawSwapQuote(network, baseTokenIdentifier, quoteTokenIdentifier, amount, side, poolAddress, slippagePct);
 
   logger.info(`Executing ${amount.toFixed(4)} ${side} swap in pool ${poolAddress}`);
 
@@ -69,7 +59,7 @@ export async function executeSwap(
         });
 
   // Simulate transaction with proper error handling (before signing)
-  await solana.simulateWithErrorHandling(swapTx, fastify);
+  await solana.simulateWithErrorHandling(swapTx);
 
   logger.info('Transaction simulated successfully, sending to network...');
 
@@ -166,7 +156,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           const quoteTokenInfo = await solana.getToken(quoteToken);
 
           if (!baseTokenInfo || !quoteTokenInfo) {
-            throw fastify.httpErrors.badRequest(
+            throw httpErrors.badRequest(
               sanitizeErrorMessage('Token not found: {}', !baseTokenInfo ? baseToken : quoteToken),
             );
           }
@@ -184,7 +174,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           );
 
           if (!pool) {
-            throw fastify.httpErrors.notFound(
+            throw httpErrors.notFound(
               `No CLMM pool found for ${baseTokenInfo.symbol}-${quoteTokenInfo.symbol} on Meteora`,
             );
           }
@@ -194,7 +184,6 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
         logger.info(`Received swap request: ${amount} ${baseToken} -> ${quoteToken} in pool ${poolAddressUsed}`);
 
         return await executeSwap(
-          fastify,
           networkUsed,
           walletAddressUsed,
           baseToken,
@@ -216,10 +205,10 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
         // Check for specific error messages
         const errorMessage = e.message || e.toString();
         if (errorMessage.includes('503') || errorMessage.includes('Service Unavailable')) {
-          throw fastify.httpErrors.serviceUnavailable('RPC service temporarily unavailable. Please try again.');
+          throw httpErrors.createError(503, 'RPC service temporarily unavailable. Please try again.');
         }
 
-        throw fastify.httpErrors.internalServerError(`Swap execution failed: ${errorMessage}`);
+        throw httpErrors.internalServerError(`Swap execution failed: ${errorMessage}`);
       }
     },
   );

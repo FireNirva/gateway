@@ -5,8 +5,8 @@ import '../../../mocks/app-mocks';
 
 import { gatewayApp } from '../../../../src/app';
 import { Ethereum } from '../../../../src/chains/ethereum/ethereum';
-import { InfuraService } from '../../../../src/chains/ethereum/infura-service';
 import { getEthereumStatus } from '../../../../src/chains/ethereum/routes/status';
+import { InfuraService } from '../../../../src/rpc/infura-service';
 
 // Mock the Ethereum class
 jest.mock('../../../../src/chains/ethereum/ethereum');
@@ -48,7 +48,7 @@ describe('Ethereum Status Route', () => {
     };
 
     const mockInfuraService = {
-      getUrlForNetwork: jest.fn(),
+      getHttpUrl: jest.fn(),
     };
 
     beforeEach(() => {
@@ -86,7 +86,7 @@ describe('Ethereum Status Route', () => {
       });
 
       mockEthereumInstance.getInfuraService.mockReturnValue(mockInfuraService);
-      mockInfuraService.getUrlForNetwork.mockReturnValue('https://mainnet.infura.io/v3/test-key');
+      mockInfuraService.getHttpUrl.mockReturnValue('https://mainnet.infura.io/v3/test-key');
 
       const result = await getEthereumStatus('mainnet');
 
@@ -100,7 +100,7 @@ describe('Ethereum Status Route', () => {
         swapProvider: 'uniswap/router',
       });
 
-      expect(mockInfuraService.getUrlForNetwork).toHaveBeenCalledWith('mainnet');
+      expect(mockInfuraService.getHttpUrl).toHaveBeenCalled();
     });
 
     it('should fallback to standard rpcUrl when rpcProvider is "infura" but service is not available', async () => {
@@ -133,7 +133,7 @@ describe('Ethereum Status Route', () => {
       });
 
       mockEthereumInstance.getInfuraService.mockReturnValue(mockInfuraService);
-      mockInfuraService.getUrlForNetwork.mockImplementation(() => {
+      mockInfuraService.getHttpUrl.mockImplementation(() => {
         throw new Error('Infura service error');
       });
 
@@ -186,7 +186,7 @@ describe('Ethereum Status Route', () => {
 
       mockEthereumInstance.rpcUrl = 'https://polygon-rpc.com';
       mockEthereumInstance.getInfuraService.mockReturnValue(mockInfuraService);
-      mockInfuraService.getUrlForNetwork.mockReturnValue('https://polygon-mainnet.infura.io/v3/test-key');
+      mockInfuraService.getHttpUrl.mockReturnValue('https://polygon-mainnet.infura.io/v3/test-key');
 
       const result = await getEthereumStatus('polygon');
 
@@ -200,7 +200,7 @@ describe('Ethereum Status Route', () => {
         swapProvider: 'uniswap/router',
       });
 
-      expect(mockInfuraService.getUrlForNetwork).toHaveBeenCalledWith('polygon');
+      expect(mockInfuraService.getHttpUrl).toHaveBeenCalled();
     });
 
     it('should handle getBlockNumber timeout and continue with block number 0', async () => {

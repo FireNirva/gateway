@@ -1,38 +1,36 @@
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { QuoteSwapRequestType } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { quoteCache } from '../../../services/quote-cache';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
-import { ZeroX, ZeroXQuoteResponse } from '../0x';
+import { ZeroX } from '../0x';
 import { ZeroXConfig } from '../0x.config';
 import { ZeroXQuoteSwapRequest, ZeroXQuoteSwapResponse } from '../schemas';
 
 async function quoteSwap(
-  fastify: FastifyInstance,
   network: string,
   baseToken: string,
   quoteToken: string,
   amount: number,
   side: 'BUY' | 'SELL',
-  slippagePct: number,
+  slippagePct: number = ZeroXConfig.config.slippagePct,
   indicativePrice: boolean = true,
   takerAddress?: string,
 ): Promise<Static<typeof ZeroXQuoteSwapResponse>> {
   const ethereum = await Ethereum.getInstance(network);
   const zeroX = await ZeroX.getInstance(network);
 
-  // Resolve token symbols to addresses
-  const baseTokenInfo = ethereum.getToken(baseToken);
-  const quoteTokenInfo = ethereum.getToken(quoteToken);
+  // Resolve token symbols/addresses to token objects from local token list
+  const baseTokenInfo = await ethereum.getToken(baseToken);
+  const quoteTokenInfo = await ethereum.getToken(quoteToken);
 
   if (!baseTokenInfo || !quoteTokenInfo) {
-    throw fastify.httpErrors.badRequest(
-      sanitizeErrorMessage('Token not found: {}', !baseTokenInfo ? baseToken : quoteToken),
-    );
+    throw httpErrors.badRequest(sanitizeErrorMessage('Token not found: {}', !baseTokenInfo ? baseToken : quoteToken));
   }
 
   // Determine input/output based on side
@@ -190,7 +188,6 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
           request.query as typeof ZeroXQuoteSwapRequest._type;
 
         return await quoteSwap(
-          fastify,
           network,
           baseToken,
           quoteToken,
@@ -206,14 +203,14 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
 
         // Handle specific error cases
         if (e.message?.includes('0x API key not configured')) {
-          throw fastify.httpErrors.badRequest(e.message);
+          throw httpErrors.badRequest(e.message);
         }
         if (e.message?.includes('0x API Error')) {
-          throw fastify.httpErrors.badRequest(e.message);
+          throw httpErrors.badRequest(e.message);
         }
 
         // Return the actual error message instead of generic one
-        throw fastify.httpErrors.internalServerError(e.message || 'Failed to get quote');
+        throw httpErrors.internalServerError(e.message || 'Failed to get quote');
       }
     },
   );

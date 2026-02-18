@@ -1,6 +1,5 @@
 import { FastifyPluginAsync } from 'fastify';
 
-import { logger } from '../../services/logger';
 import { TokenService } from '../../services/token-service';
 import {
   TokenRemoveQuery,
@@ -8,6 +7,7 @@ import {
   TokenOperationResponse,
   TokenOperationResponseSchema,
 } from '../schemas';
+import { handleTokenError } from '../token-error-handler';
 
 export const removeTokenRoute: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{
@@ -45,21 +45,10 @@ export const removeTokenRoute: FastifyPluginAsync = async (fastify) => {
         await tokenService.removeToken(chain, network, address);
 
         return {
-          message: `Token with address ${address} removed successfully from ${chain}/${network}. Gateway restart required.`,
-          requiresRestart: true,
+          message: `Token with address ${address} removed successfully from ${chain}/${network}.`,
         };
       } catch (error) {
-        logger.error(`Failed to remove token: ${error.message}`);
-
-        if (error.message.includes('not found')) {
-          throw fastify.httpErrors.notFound(error.message);
-        }
-
-        if (error.message.includes('Unsupported chain')) {
-          throw fastify.httpErrors.badRequest(error.message);
-        }
-
-        throw fastify.httpErrors.internalServerError('Failed to remove token');
+        handleTokenError(fastify, error, 'Failed to remove token');
       }
     },
   );

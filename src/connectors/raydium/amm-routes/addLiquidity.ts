@@ -15,7 +15,6 @@ import { FastifyPluginAsync, FastifyInstance } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import {
-  AddLiquidityRequestType,
   AddLiquidityResponse,
   AddLiquidityResponseType,
   QuoteLiquidityResponseType,
@@ -112,7 +111,7 @@ async function addLiquidity(
   poolAddress: string,
   baseTokenAmount: number,
   quoteTokenAmount: number,
-  slippagePct?: number,
+  slippagePct: number = RaydiumConfig.config.slippagePct,
 ): Promise<AddLiquidityResponseType> {
   const solana = await Solana.getInstance(network);
   const raydium = await Raydium.getInstance(network);
@@ -157,9 +156,8 @@ async function addLiquidity(
     `Quote response: baseLimited=${baseLimited}, quotedBase=${quotedBaseAmount}, quotedQuote=${quotedQuoteAmount}`,
   );
   logger.info(`Amounts to add: base=${baseTokenAmountAdded}, quote=${quoteTokenAmountAdded}`);
-  const slippageValue = slippagePct === 0 ? 0 : slippagePct || RaydiumConfig.config.slippagePct;
   // Convert percentage to basis points (e.g., 1% = 100 basis points)
-  const slippage = new Percent(Math.floor(slippageValue * 100), 10000);
+  const slippage = new Percent(Math.floor(slippagePct * 100), 10000);
 
   // Use hardcoded compute units for AMM add liquidity
   const COMPUTE_UNITS = 400000;
@@ -217,8 +215,8 @@ async function addLiquidity(
     const tokenBInfo = await solana.getToken(poolInfo.mintB.address);
 
     const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, walletAddress, [
-      tokenAInfo.address,
-      tokenBInfo.address,
+      tokenAInfo?.address || poolInfo.mintA.address,
+      tokenBInfo?.address || poolInfo.mintB.address,
     ]);
 
     const baseTokenBalanceChange = balanceChanges[0];
@@ -273,9 +271,7 @@ export const addLiquidityRoute: FastifyPluginAsync = async (fastify) => {
         );
       } catch (e) {
         logger.error(e);
-        if (e.statusCode) {
-          throw fastify.httpErrors.createError(e.statusCode, e.message);
-        }
+        if (e.statusCode) throw e;
         throw fastify.httpErrors.internalServerError('Internal server error');
       }
     },

@@ -1,12 +1,14 @@
 import { Static } from '@sinclair/typebox';
 import { PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { OpenPositionResponse, OpenPositionResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { PancakeswapSol } from '../pancakeswap-sol';
+import { PancakeswapSolConfig } from '../pancakeswap-sol.config';
 import { priceToTick, roundTickToSpacing, parsePoolTickSpacing } from '../pancakeswap-sol.parser';
 import { buildOpenPositionTransaction } from '../pancakeswap-sol.transactions';
 import { PancakeswapSolClmmOpenPositionRequest } from '../schemas';
@@ -14,7 +16,6 @@ import { PancakeswapSolClmmOpenPositionRequest } from '../schemas';
 import { quotePosition } from './quotePosition';
 
 export async function openPosition(
-  _fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   poolAddress: string,
@@ -38,7 +39,7 @@ export async function openPosition(
   // Get pool info
   const poolInfo = await pancakeswapSol.getClmmPoolInfo(poolAddress);
   if (!poolInfo) {
-    throw _fastify.httpErrors.notFound(`Pool not found: ${poolAddress}`);
+    throw httpErrors.notFound(`Pool not found: ${poolAddress}`);
   }
 
   logger.info(`Pool Info:`);
@@ -53,7 +54,7 @@ export async function openPosition(
   const quoteToken = await solana.getToken(poolInfo.quoteTokenAddress);
 
   if (!baseToken || !quoteToken) {
-    throw _fastify.httpErrors.notFound('Token information not found');
+    throw httpErrors.notFound('Token information not found');
   }
 
   logger.info(
@@ -64,21 +65,21 @@ export async function openPosition(
   const walletPubkey = new PublicKey(walletAddress);
   const poolPubkey = new PublicKey(poolAddress);
 
-  // Get quote for position amounts
+  // Get quote for position amounts with slippage
   const quote = await quotePosition(
-    _fastify,
     network,
     lowerPrice,
     upperPrice,
     poolAddress,
     baseTokenAmount,
     quoteTokenAmount,
+    slippagePct,
   );
 
   // Get pool data to extract tick spacing
   const poolAccountInfo = await solana.connection.getAccountInfo(poolPubkey);
   if (!poolAccountInfo) {
-    throw _fastify.httpErrors.notFound(`Pool account not found: ${poolAddress}`);
+    throw httpErrors.notFound(`Pool account not found: ${poolAddress}`);
   }
   const tickSpacing = parsePoolTickSpacing(poolAccountInfo.data);
 
@@ -104,16 +105,11 @@ export async function openPosition(
   );
   logger.info(`Quote Max: base=${quote.baseTokenAmountMax}, quote=${quote.quoteTokenAmountMax}`);
 
-  // Convert amounts to BN with slippage
-  const effectiveSlippage = slippagePct || 1.0;
-  const amount0Max = new BN(
-    (quote.baseTokenAmountMax * (1 + effectiveSlippage / 100) * 10 ** baseToken.decimals).toFixed(0),
-  );
-  const amount1Max = new BN(
-    (quote.quoteTokenAmountMax * (1 + effectiveSlippage / 100) * 10 ** quoteToken.decimals).toFixed(0),
-  );
+  // Use max amounts from quote - slippage already applied in quotePosition
+  const amount0Max = new BN((quote.baseTokenAmountMax * 10 ** baseToken.decimals).toFixed(0));
+  const amount1Max = new BN((quote.quoteTokenAmountMax * 10 ** quoteToken.decimals).toFixed(0));
 
-  logger.info(`Amounts with slippage (${effectiveSlippage}%):`);
+  logger.info(`Amounts with slippage (${slippagePct ?? PancakeswapSolConfig.config.slippagePct}%):`);
   logger.info(`  amount0Max: ${amount0Max.toString()} (${baseToken.symbol})`);
   logger.info(`  amount1Max: ${amount1Max.toString()} (${quoteToken.symbol})`);
 
@@ -143,7 +139,7 @@ export async function openPosition(
   // Sign with both wallet and NFT mint keypair
   transaction.sign([wallet, positionNftMint]);
 
-  await solana.simulateWithErrorHandling(transaction, _fastify);
+  await solana.simulateWithErrorHandling(transaction);
 
   const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction);
 
@@ -213,7 +209,6 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
         } = request.body;
 
         return await openPosition(
-          fastify,
           network,
           walletAddress!,
           poolAddress,
@@ -231,7 +226,7 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
         }
         // Handle unknown errors
         const errorMessage = e.message || 'Failed to open position';
-        throw fastify.httpErrors.internalServerError(errorMessage);
+        throw httpErrors.internalServerError(errorMessage);
       }
     },
   );

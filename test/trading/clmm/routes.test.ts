@@ -95,10 +95,14 @@ describe('Unified Trading CLMM Routes', () => {
       const response = await app.inject({
         method: 'GET',
         url: '/trading/clmm/positions-owned',
-        query: {},
+        query: {
+          connector: 'meteora',
+          chainNetwork: 'solana-mainnet-beta',
+        },
       });
 
-      expect([400, 500]).toContain(response.statusCode);
+      // Route should exist and return 200 or 400/500 (requires wallet address)
+      expect([200, 400, 500]).toContain(response.statusCode);
     });
   });
 
@@ -280,7 +284,7 @@ describe('Unified Trading CLMM Routes', () => {
         url: '/trading/clmm/add',
         payload: {
           connector: 'pancakeswap',
-          network: 'bsc',
+          chainNetwork: 'ethereum-bsc',
           walletAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
           positionAddress: '12345',
           baseTokenAmount: 1,

@@ -156,28 +156,11 @@ export class Pancakeswap {
   }
 
   /**
-   * Given a token's address, return the connector's native representation of the token.
+   * Get token by symbol or address from local token list
    */
-  public getTokenByAddress(address: string): Token | null {
-    const tokenInfo = this.ethereum.getToken(address);
-    if (!tokenInfo) return null;
-
-    // Create Pancakeswap SDK Token instance
-    return new Token(
-      tokenInfo.chainId,
-      tokenInfo.address as Address,
-      tokenInfo.decimals,
-      tokenInfo.symbol,
-      tokenInfo.name,
-    );
-  }
-
-  /**
-   * Given a token's symbol, return the connector's native representation of the token.
-   */
-  public getTokenBySymbol(symbol: string): Token | null {
-    // Just use getTokenByAddress since ethereum.getToken handles both symbols and addresses
-    return this.getTokenByAddress(symbol);
+  public async getToken(symbolOrAddress: string): Promise<Token | null> {
+    const tokenInfo = await this.ethereum.getToken(symbolOrAddress);
+    return tokenInfo ? this.getPancakeswapToken(tokenInfo) : null;
   }
 
   /**
@@ -201,7 +184,7 @@ export class Pancakeswap {
    * @param outputToken The token being swapped to
    * @param amount The amount to swap
    * @param side The trade direction (BUY or SELL)
-   * @param walletAddress The recipient wallet address
+   * @param walletAddress The recipient wallet address (optional for quotes)
    * @returns Quote result from Universal Router
    */
   public async getUniversalRouterQuote(
@@ -209,7 +192,7 @@ export class Pancakeswap {
     outputToken: Token,
     amount: number,
     side: 'BUY' | 'SELL',
-    walletAddress: string,
+    walletAddress?: string,
   ): Promise<any> {
     // Determine input/output based on side
     const exactIn = side === 'SELL';
@@ -227,6 +210,8 @@ export class Pancakeswap {
     const slippageTolerance = new Percent(Math.floor(this.config.slippagePct * 100), 10000);
 
     // Get quote from Universal Router
+    // Use a placeholder address for quotes when no wallet is provided
+    const recipient = walletAddress || '0x0000000000000000000000000000000000000001';
     const quoteResult = await this.universalRouter.getQuote(
       inputToken,
       outputToken,
@@ -235,8 +220,10 @@ export class Pancakeswap {
       {
         slippageTolerance,
         deadline: Math.floor(Date.now() / 1000 + 1800), // 30 minutes
-        recipient: walletAddress,
+        recipient,
         protocols: protocolsToUse,
+        maxHops: this.config.maximumHops,
+        maxSplits: this.config.maximumSplits,
       },
     );
 
@@ -251,10 +238,9 @@ export class Pancakeswap {
       // Resolve pool address if provided
       let pairAddress = poolAddress;
 
-      // If tokenA and tokenB are strings, assume they are symbols
-      const tokenAObj = typeof tokenA === 'string' ? this.getTokenBySymbol(tokenA) : tokenA;
-
-      const tokenBObj = typeof tokenB === 'string' ? this.getTokenBySymbol(tokenB) : tokenB;
+      // If tokenA and tokenB are strings, resolve them to Token objects
+      const tokenAObj = typeof tokenA === 'string' ? await this.getToken(tokenA) : tokenA;
+      const tokenBObj = typeof tokenB === 'string' ? await this.getToken(tokenB) : tokenB;
 
       if (!tokenAObj || !tokenBObj) {
         throw new Error(`Invalid tokens: ${tokenA}, ${tokenB}`);
@@ -309,10 +295,9 @@ export class Pancakeswap {
       // Resolve pool address if provided
       let poolAddr = poolAddress;
 
-      // If tokenA and tokenB are strings, assume they are symbols
-      const tokenAObj = typeof tokenA === 'string' ? this.getTokenBySymbol(tokenA) : tokenA;
-
-      const tokenBObj = typeof tokenB === 'string' ? this.getTokenBySymbol(tokenB) : tokenB;
+      // If tokenA and tokenB are strings, resolve them to Token objects
+      const tokenAObj = typeof tokenA === 'string' ? await this.getToken(tokenA) : tokenA;
+      const tokenBObj = typeof tokenB === 'string' ? await this.getToken(tokenB) : tokenB;
 
       if (!tokenAObj || !tokenBObj) {
         throw new Error(`Invalid tokens: ${tokenA}, ${tokenB}`);
@@ -407,16 +392,19 @@ export class Pancakeswap {
       logger.info(`Finding ${poolType} pool for ${baseToken}-${quoteToken} on ${this.networkName}`);
 
       // Resolve token symbols if addresses are provided
-      const baseTokenInfo = this.getTokenBySymbol(baseToken) || this.getTokenByAddress(baseToken);
-      const quoteTokenInfo = this.getTokenBySymbol(quoteToken) || this.getTokenByAddress(quoteToken);
+      const baseTokenInfo = await this.ethereum.getToken(baseToken);
+      const quoteTokenInfo = await this.ethereum.getToken(quoteToken);
 
       if (!baseTokenInfo || !quoteTokenInfo) {
         logger.warn(`Token not found: ${!baseTokenInfo ? baseToken : quoteToken}`);
         return null;
       }
 
+      const baseToken_sdk = this.getPancakeswapToken(baseTokenInfo);
+      const quoteToken_sdk = this.getPancakeswapToken(quoteTokenInfo);
+
       logger.info(
-        `Resolved tokens: ${baseTokenInfo.symbol} (${baseTokenInfo.address}), ${quoteTokenInfo.symbol} (${quoteTokenInfo.address})`,
+        `Resolved tokens: ${baseToken_sdk.symbol} (${baseToken_sdk.address}), ${quoteToken_sdk.symbol} (${quoteToken_sdk.address})`,
       );
 
       // Use PoolService to find pool by token pair

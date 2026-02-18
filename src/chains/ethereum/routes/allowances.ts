@@ -39,13 +39,13 @@ export async function getEthereumAllowances(
     let tokenInfoMap: Record<string, TokenInfo>;
     if (!tokens || tokens.length === 0) {
       // Get all tokens from the token list
-      const allTokens = ethereum.storedTokenList;
+      const allTokens = await ethereum.getTokenList();
       tokenInfoMap = {};
       for (const token of allTokens) {
         tokenInfoMap[token.symbol] = token;
       }
     } else {
-      tokenInfoMap = ethereum.getTokensAsMap(tokens);
+      tokenInfoMap = await ethereum.getTokensAsMap(tokens);
 
       // Check if any tokens were found
       const foundSymbols = Object.keys(tokenInfoMap);

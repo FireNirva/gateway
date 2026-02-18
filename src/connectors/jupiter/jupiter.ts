@@ -8,9 +8,11 @@ import { logger } from '../../services/logger';
 
 import { JupiterConfig } from './jupiter.config';
 
-// Jupiter API base URL
-const JUPITER_API_BASE_FREE = 'https://lite-api.jup.ag';
-const JUPITER_API_BASE_PAID = 'https://api.jup.ag';
+// Jupiter API base URLs
+// Note: lite-api.jup.ag will be deprecated on Dec 31, 2025
+// Users should migrate to api.jup.ag with an API key (free tier available at https://portal.jup.ag)
+const JUPITER_API_BASE_LITE = 'https://lite-api.jup.ag';
+const JUPITER_API_BASE = 'https://api.jup.ag';
 
 // Type definitions for Jupiter API responses
 interface QuoteResponse {
@@ -46,15 +48,19 @@ export class Jupiter {
       'Content-Type': 'application/json',
     };
 
-    let baseURL = JUPITER_API_BASE_FREE;
+    let baseURL: string;
 
-    // Add API key header if provided and use paid endpoint
+    // Use api.jup.ag with API key, or lite-api.jup.ag without (deprecated Dec 31, 2025)
     if (this.config.apiKey && this.config.apiKey.length > 0) {
       headers['x-api-key'] = this.config.apiKey;
-      baseURL = JUPITER_API_BASE_PAID;
-      logger.info('Using Jupiter paid API with key');
+      baseURL = JUPITER_API_BASE;
+      logger.info('Using Jupiter API with key');
     } else {
-      logger.info('Using Jupiter free tier (no API key)');
+      baseURL = JUPITER_API_BASE_LITE;
+      logger.warn(
+        'No Jupiter API key configured. Using lite-api.jup.ag which will be deprecated on Dec 31, 2025. ' +
+          'Get a free API key at https://portal.jup.ag and add it to jupiter.apiKey in your config.',
+      );
     }
 
     this.httpClient = axios.create({
@@ -260,9 +266,8 @@ export class Jupiter {
     const swapTransactionBuf = Buffer.from(swapObj.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(new Uint8Array(swapTransactionBuf));
 
-    // Sign and simulate the transaction
+    // Sign the transaction (simulation will be done by caller with proper error handling)
     transaction.sign([wallet.payer]);
-    await this.solana.simulateTransaction(transaction);
 
     return transaction;
   }
@@ -343,8 +348,7 @@ export class Jupiter {
     const transaction = VersionedTransaction.deserialize(new Uint8Array(swapTransactionBuf));
 
     // Don't sign the transaction - it will be signed by the hardware wallet
-    // But we still simulate it to ensure it's valid
-    await this.solana.simulateTransaction(transaction);
+    // Simulation will be done by caller with proper error handling
 
     return transaction;
   }

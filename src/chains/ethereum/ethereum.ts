@@ -1,18 +1,19 @@
-import { Provider } from '@ethersproject/abstract-provider';
+import { Provider, TransactionResponse } from '@ethersproject/abstract-provider';
 import { BigNumber, Contract, ContractTransaction, providers, utils, Wallet, ethers } from 'ethers';
 import { getAddress } from 'ethers/lib/utils';
 import fse from 'fs-extra';
 
+import { InfuraService } from '../../rpc/infura-service';
+import { createRateLimitAwareEthereumProvider } from '../../rpc/rpc-connection-interceptor';
 import { TokenValue, tokenValueToString } from '../../services/base';
 import { ConfigManagerCertPassphrase } from '../../services/config-manager-cert-passphrase';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
-import { logger } from '../../services/logger';
+import { logger, redactUrl } from '../../services/logger';
 import { TokenService } from '../../services/token-service';
 import { walletPath, isHardwareWallet as checkIsHardwareWallet } from '../../wallet/utils';
 
 import { getEthereumNetworkConfig, getEthereumChainConfig } from './ethereum.config';
 import { EtherscanService } from './etherscan-service';
-import { InfuraService } from './infura-service';
 
 // information about an Ethereum token
 export interface TokenInfo {
@@ -29,8 +30,6 @@ export type NewDebugMsgHandler = (msg: any) => void;
 export class Ethereum {
   private static _instances: { [name: string]: Ethereum };
   public provider: providers.StaticJsonRpcProvider;
-  public tokenList: TokenInfo[] = [];
-  public tokenMap: Record<string, TokenInfo> = {};
   public network: string;
   public nativeTokenSymbol: string;
   public chainId: number;
@@ -54,6 +53,7 @@ export class Ethereum {
     };
   } = {};
   private static GAS_PRICE_CACHE_MS = 10000; // 10 second cache
+  private _transactionExecutionTimeoutMs: number;
 
   // For backward compatibility
   public get chain(): string {
@@ -71,6 +71,7 @@ export class Ethereum {
     this.baseFee = config.baseFee;
     this.priorityFee = config.priorityFee;
     this.baseFeeMultiplier = config.baseFeeMultiplier || 1.2; // Default to 1.2
+    this._transactionExecutionTimeoutMs = config.transactionExecutionTimeoutMs ?? 30000; // Default to 30 seconds
 
     // Get chain config for etherscanAPIKey
     const chainConfig = getEthereumChainConfig();
@@ -92,12 +93,13 @@ export class Ethereum {
 
     // Initialize RPC connection based on provider
     if (rpcProvider === 'infura') {
-      logger.info(`Initializing Infura services for provider: ${rpcProvider}`);
-      this.initializeInfuraProvider(config);
+      this.initializeInfuraProvider();
     } else {
-      logger.info(`Using standard RPC provider: ${rpcProvider}`);
-      logger.info(`Initializing Ethereum connector for network: ${network}, RPC URL: ${this.rpcUrl}`);
-      this.provider = new providers.StaticJsonRpcProvider(this.rpcUrl);
+      // Default: use nodeURL with rate limit detection
+      this.provider = createRateLimitAwareEthereumProvider(
+        new providers.StaticJsonRpcProvider(this.rpcUrl),
+        this.rpcUrl,
+      );
     }
   }
 
@@ -399,35 +401,42 @@ export class Ethereum {
   /**
    * Initialize Infura provider with configuration
    */
-  private initializeInfuraProvider(config: any): void {
+  private initializeInfuraProvider(): void {
     try {
       const configManager = ConfigManagerV2.getInstance();
-      const infuraApiKey = configManager.get('infura.apiKey') || '';
-      const useWebSocket = configManager.get('infura.useWebSocket') || false;
+      const providerConfig = {
+        apiKey: configManager.get('apiKeys.infura') || '',
+      };
 
-      if (!infuraApiKey || infuraApiKey.trim() === '') {
-        logger.warn(`⚠️ Infura provider selected but no API key configured`);
-        logger.info(`Using standard RPC from nodeURL: ${this.rpcUrl}`);
-        this.provider = new providers.StaticJsonRpcProvider(this.rpcUrl);
+      // Validate API key
+      if (!providerConfig.apiKey || providerConfig.apiKey.trim() === '' || providerConfig.apiKey.includes('YOUR_')) {
+        logger.warn(`⚠️ Infura provider selected but no valid API key configured`);
+        logger.info(`Using standard RPC from nodeURL: ${redactUrl(this.rpcUrl)}`);
+        this.provider = createRateLimitAwareEthereumProvider(
+          new providers.StaticJsonRpcProvider(this.rpcUrl),
+          this.rpcUrl,
+        );
         return;
       }
 
-      // Merge configs for InfuraService
-      const mergedConfig = {
-        ...config,
-        infuraAPIKey: infuraApiKey,
-        useInfuraWebSocket: useWebSocket,
-      };
+      // Create InfuraService instance
+      this.infuraService = new InfuraService(providerConfig, {
+        chain: 'ethereum',
+        network: this.network,
+        chainId: this.chainId,
+      });
 
-      logger.info(`✅ Infura API key configured (length: ${infuraApiKey.length} chars)`);
-      logger.info(`Infura features enabled - WebSocket: ${useWebSocket}`);
+      logger.info(`✅ Infura API key configured (length: ${providerConfig.apiKey.length} chars)`);
 
-      this.infuraService = new InfuraService(mergedConfig);
+      // Use Infura provider
       this.provider = this.infuraService.getProvider() as providers.StaticJsonRpcProvider;
     } catch (error: any) {
       logger.warn(`Failed to initialize Infura provider: ${error.message}`);
-      logger.info(`Using standard RPC from nodeURL: ${this.rpcUrl}`);
-      this.provider = new providers.StaticJsonRpcProvider(this.rpcUrl);
+      logger.info(`Using standard RPC from nodeURL: ${redactUrl(this.rpcUrl)}`);
+      this.provider = createRateLimitAwareEthereumProvider(
+        new providers.StaticJsonRpcProvider(this.rpcUrl),
+        this.rpcUrl,
+      );
     }
   }
 
@@ -436,7 +445,6 @@ export class Ethereum {
    */
   public async init(): Promise<void> {
     try {
-      await this.loadTokens();
       this._initialized = true;
     } catch (e) {
       logger.error(`Failed to initialize Ethereum chain: ${e}`);
@@ -445,45 +453,27 @@ export class Ethereum {
   }
 
   /**
-   * Load tokens from the token list source
+   * Get all tokens from the token list (reads from disk each time)
    */
-  public async loadTokens(): Promise<void> {
-    logger.info(`Loading tokens for ethereum/${this.network} using TokenService`);
-    try {
-      // Use TokenService to load tokens
-      const tokens = await TokenService.getInstance().loadTokenList('ethereum', this.network);
-
-      // Convert to TokenInfo format with chainId and normalize addresses
-      this.tokenList = tokens.map((token) => ({
-        ...token,
-        address: getAddress(token.address), // Normalize to checksummed address
-        chainId: this.chainId,
-      }));
-
-      if (this.tokenList) {
-        logger.info(`Loaded ${this.tokenList.length} tokens for ethereum/${this.network}`);
-        // Build token map for faster lookups
-        this.tokenList.forEach((token: TokenInfo) => (this.tokenMap[token.symbol] = token));
-      }
-    } catch (error) {
-      logger.error(`Failed to load token list: ${error.message}`);
-      throw error;
-    }
+  public async getTokenList(): Promise<TokenInfo[]> {
+    const tokens = await TokenService.getInstance().loadTokenList('ethereum', this.network);
+    return tokens.map((token) => ({
+      ...token,
+      address: getAddress(token.address), // Normalize to checksummed address
+      chainId: this.chainId,
+    }));
   }
 
   /**
-   * Get all tokens loaded from the token list
+   * Get token info by symbol or address from local token list only
+   * @param tokenSymbol Token symbol or contract address
+   * @returns TokenInfo object or undefined if token not found in local list
    */
-  public get storedTokenList(): TokenInfo[] {
-    return Object.values(this.tokenMap);
-  }
+  public async getToken(tokenSymbol: string): Promise<TokenInfo | undefined> {
+    const tokenList = await this.getTokenList();
 
-  /**
-   * Get token info by symbol or address
-   */
-  public getToken(tokenSymbol: string): TokenInfo | undefined {
     // First try to find token by symbol
-    const tokenBySymbol = this.tokenList.find(
+    const tokenBySymbol = tokenList.find(
       (token: TokenInfo) => token.symbol.toUpperCase() === tokenSymbol.toUpperCase() && token.chainId === this.chainId,
     );
 
@@ -495,7 +485,7 @@ export class Ethereum {
     try {
       const normalizedAddress = utils.getAddress(tokenSymbol);
       // Try to find token by normalized address
-      return this.tokenList.find(
+      return tokenList.find(
         (token: TokenInfo) =>
           token.address.toLowerCase() === normalizedAddress.toLowerCase() && token.chainId === this.chainId,
       );
@@ -511,11 +501,11 @@ export class Ethereum {
    * @param tokens Array of token symbols or addresses
    * @returns Map of token symbol to TokenInfo for found tokens
    */
-  public getTokensAsMap(tokens: string[]): Record<string, TokenInfo> {
+  public async getTokensAsMap(tokens: string[]): Promise<Record<string, TokenInfo>> {
     const tokenMap: Record<string, TokenInfo> = {};
 
     for (const symbolOrAddress of tokens) {
-      const tokenInfo = this.getToken(symbolOrAddress);
+      const tokenInfo = await this.getToken(symbolOrAddress);
       if (tokenInfo) {
         // Use the actual token symbol as the key, not the input which might be an address
         tokenMap[tokenInfo.symbol] = tokenInfo;
@@ -555,11 +545,11 @@ export class Ethereum {
       const path = `${walletPath}/ethereum`;
       const encryptedPrivateKey = await fse.readFile(`${path}/${validatedAddress}.json`, 'utf8');
 
-      const passphrase = ConfigManagerCertPassphrase.readPassphrase();
-      if (!passphrase) {
-        throw new Error('Missing passphrase');
+      const walletKey = ConfigManagerCertPassphrase.readWalletKey();
+      if (!walletKey) {
+        throw new Error('Missing wallet encryption key');
       }
-      return await this.decrypt(encryptedPrivateKey, passphrase);
+      return await this.decrypt(encryptedPrivateKey, walletKey);
     } catch (error) {
       if (error.message.includes('Invalid Ethereum address')) {
         throw error; // Re-throw validation errors
@@ -916,6 +906,28 @@ export class Ethereum {
     return ethers.utils.isAddress(address);
   }
 
+  public async handleTransactionExecution(tx: TransactionResponse): Promise<providers.TransactionReceipt | null> {
+    return await Promise.race([
+      tx.wait(1).then((receipt) => {
+        // Transaction confirmed (status: 1) or failed/reverted (status: 0)
+        logger.info(
+          `Transaction ${tx.hash} ${receipt.status === 1 ? 'confirmed' : 'failed'} in block ${receipt.blockNumber}`,
+        );
+        return receipt;
+      }),
+      new Promise<null>((resolve) =>
+        setTimeout(() => {
+          // Timeout reached, transaction is still pending
+          // Return null to indicate pending - the caller should check for null
+          // Note: Do NOT return a fake receipt with status: 0, because in Ethereum
+          // receipt.status === 0 means "reverted/failed", not "pending"
+          logger.warn(`Transaction ${tx.hash} is still pending after timeout`);
+          resolve(null);
+        }, this._transactionExecutionTimeoutMs),
+      ),
+    ]);
+  }
+
   /**
    * Handle transaction confirmation status and return appropriate response
    * Similar to Solana's handleConfirmation helper
@@ -927,13 +939,14 @@ export class Ethereum {
    * @param side Trade side (optional)
    * @returns Response object with status and data
    */
-  public handleTransactionConfirmation(
+  public handleExecuteQuoteTransactionConfirmation(
     txReceipt: providers.TransactionReceipt | null,
     inputToken: string,
     outputToken: string,
     expectedAmountIn: number,
     expectedAmountOut: number,
     side?: 'BUY' | 'SELL',
+    txHash?: string, // Optional tx hash for pending transactions
   ): {
     signature: string;
     status: number;
@@ -951,8 +964,8 @@ export class Ethereum {
       // Transaction receipt not available - still pending
       logger.warn('Transaction pending, no receipt available yet');
       return {
-        signature: '',
-        status: 0, // PENDING
+        signature: txHash || '', // Use provided txHash for pending transactions
+        status: 0, // PENDING (TransactionStatus.PENDING = 0)
         data: undefined,
       };
     }
@@ -964,7 +977,7 @@ export class Ethereum {
       logger.error(`Transaction ${signature} failed on-chain`);
       return {
         signature,
-        status: -1, // FAILED
+        status: -1, // FAILED (TransactionStatus.FAILED = -1)
         data: {
           tokenIn: inputToken,
           tokenOut: outputToken,
@@ -1074,10 +1087,11 @@ export class Ethereum {
     isHardware: boolean,
     balances: Record<string, number>,
   ): Promise<void> {
-    logger.info(`Checking balances for all ${this.storedTokenList.length} tokens in the token list`);
+    const tokenList = await this.getTokenList();
+    logger.info(`Checking balances for all ${tokenList.length} tokens in the token list`);
 
     await Promise.all(
-      this.storedTokenList.map(async (token) => {
+      tokenList.map(async (token) => {
         try {
           const contract = this.getContract(token.address, this.provider);
           const balance = isHardware
@@ -1115,7 +1129,7 @@ export class Ethereum {
           return;
         }
 
-        const token = this.getToken(symbolOrAddress);
+        const token = await this.getToken(symbolOrAddress);
         if (token) {
           try {
             const contract = this.getContract(token.address, this.provider);

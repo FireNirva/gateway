@@ -1,28 +1,27 @@
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
-import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { ExecuteSwapRequestType, SwapExecuteResponseType, SwapExecuteResponse } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
+import { ZeroXConfig } from '../0x.config';
 import { ZeroXExecuteSwapRequest } from '../schemas';
 
 import { executeQuote } from './executeQuote';
 import { quoteSwap } from './quoteSwap';
 
 async function executeSwap(
-  fastify: FastifyInstance,
   walletAddress: string,
   network: string,
   baseToken: string,
   quoteToken: string,
   amount: number,
   side: 'BUY' | 'SELL',
-  slippagePct: number,
+  slippagePct: number = ZeroXConfig.config.slippagePct,
   gasPrice?: string,
   maxGas?: number,
 ): Promise<SwapExecuteResponseType> {
   // Step 1: Get a fresh firm quote using the quoteSwap function
   const quoteResult = await quoteSwap(
-    fastify,
     network,
     baseToken,
     quoteToken,
@@ -34,7 +33,7 @@ async function executeSwap(
   );
 
   // Step 2: Execute the quote immediately using executeQuote function
-  const executeResult = await executeQuote(fastify, walletAddress, network, quoteResult.quoteId, gasPrice, maxGas);
+  const executeResult = await executeQuote(walletAddress, network, quoteResult.quoteId, gasPrice, maxGas);
 
   return executeResult;
 }
@@ -61,7 +60,6 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           request.body as typeof ZeroXExecuteSwapRequest._type;
 
         return await executeSwap(
-          fastify,
           walletAddress,
           network,
           baseToken,
@@ -75,7 +73,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing 0x swap:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

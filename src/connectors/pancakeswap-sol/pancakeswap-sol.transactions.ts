@@ -6,13 +6,10 @@ import {
   NATIVE_MINT,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
-  createSyncNativeInstruction,
-  createCloseAccountInstruction,
 } from '@solana/spl-token';
 import {
   PublicKey,
   TransactionInstruction,
-  SystemProgram,
   SYSVAR_RENT_PUBKEY,
   ComputeBudgetProgram,
   TransactionMessage,
@@ -100,18 +97,10 @@ export async function buildSwapTransaction(
     );
   }
 
-  // If input is native SOL, wrap it (regardless of whether account exists)
+  // If input is native SOL, wrap it using Solana's wrapSOL method
   if (isInputSOL) {
-    // Transfer SOL to WSOL account to wrap it
-    instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: walletPubkey,
-        toPubkey: inputTokenAccount,
-        lamports: amount.toNumber(),
-      }),
-    );
-    // Sync native (wraps SOL to WSOL)
-    instructions.push(createSyncNativeInstruction(inputTokenAccount, inputTokenProgram));
+    const wrapInstructions = await solana.wrapSOL(walletPubkey, amount.toNumber(), inputTokenProgram);
+    instructions.push(...wrapInstructions);
   }
 
   // Create output token account if needed
@@ -141,7 +130,7 @@ export async function buildSwapTransaction(
   );
   instructions.push(swapIx);
 
-  // If output is native SOL, unwrap WSOL back to SOL
+  // If output is native SOL, unwrap WSOL back to SOL using Solana's unwrapSOL method
   const isOutputSOL = outputMint.equals(NATIVE_MINT);
   if (isOutputSOL) {
     const unwrapIx = solana.unwrapSOL(walletPubkey, outputTokenProgram);
@@ -346,40 +335,26 @@ export async function buildAddLiquidityTransaction(
 
   // Handle token0 (create ATA if needed, wrap SOL if native)
   const isToken0SOL = token0Mint.equals(NATIVE_MINT);
-  if (!token0AccountInfo) {
+  if (isToken0SOL) {
+    // Use solana.wrapSOL() which handles ATA creation and wrapping
+    const wrapInstructions = await solana.wrapSOL(walletPubkey, amount0Max.toNumber(), token0Program);
+    instructions.push(...wrapInstructions);
+  } else if (!token0AccountInfo) {
     instructions.push(
       createAssociatedTokenAccountInstruction(walletPubkey, token0Account, walletPubkey, token0Mint, token0Program),
     );
   }
-  if (isToken0SOL) {
-    // Transfer SOL to WSOL account and sync
-    instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: walletPubkey,
-        toPubkey: token0Account,
-        lamports: amount0Max.toNumber(),
-      }),
-    );
-    instructions.push(createSyncNativeInstruction(token0Account, token0Program));
-  }
 
   // Handle token1 (create ATA if needed, wrap SOL if native)
   const isToken1SOL = token1Mint.equals(NATIVE_MINT);
-  if (!token1AccountInfo) {
+  if (isToken1SOL) {
+    // Use solana.wrapSOL() which handles ATA creation and wrapping
+    const wrapInstructions = await solana.wrapSOL(walletPubkey, amount1Max.toNumber(), token1Program);
+    instructions.push(...wrapInstructions);
+  } else if (!token1AccountInfo) {
     instructions.push(
       createAssociatedTokenAccountInstruction(walletPubkey, token1Account, walletPubkey, token1Mint, token1Program),
     );
-  }
-  if (isToken1SOL) {
-    // Transfer SOL to WSOL account and sync
-    instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: walletPubkey,
-        toPubkey: token1Account,
-        lamports: amount1Max.toNumber(),
-      }),
-    );
-    instructions.push(createSyncNativeInstruction(token1Account, token1Program));
   }
 
   // Build add liquidity instruction
@@ -461,40 +436,26 @@ export async function buildOpenPositionTransaction(
 
   // Handle token0 (create ATA if needed, wrap SOL if native)
   const isToken0SOL = token0Mint.equals(NATIVE_MINT);
-  if (!token0AccountInfo) {
+  if (isToken0SOL) {
+    // Use solana.wrapSOL() which handles ATA creation and wrapping
+    const wrapInstructions = await solana.wrapSOL(walletPubkey, amount0Max.toNumber(), token0Program);
+    instructions.push(...wrapInstructions);
+  } else if (!token0AccountInfo) {
     instructions.push(
       createAssociatedTokenAccountInstruction(walletPubkey, token0Account, walletPubkey, token0Mint, token0Program),
     );
   }
-  if (isToken0SOL) {
-    // Transfer SOL to WSOL account and sync
-    instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: walletPubkey,
-        toPubkey: token0Account,
-        lamports: amount0Max.toNumber(),
-      }),
-    );
-    instructions.push(createSyncNativeInstruction(token0Account, token0Program));
-  }
 
   // Handle token1 (create ATA if needed, wrap SOL if native)
   const isToken1SOL = token1Mint.equals(NATIVE_MINT);
-  if (!token1AccountInfo) {
+  if (isToken1SOL) {
+    // Use solana.wrapSOL() which handles ATA creation and wrapping
+    const wrapInstructions = await solana.wrapSOL(walletPubkey, amount1Max.toNumber(), token1Program);
+    instructions.push(...wrapInstructions);
+  } else if (!token1AccountInfo) {
     instructions.push(
       createAssociatedTokenAccountInstruction(walletPubkey, token1Account, walletPubkey, token1Mint, token1Program),
     );
-  }
-  if (isToken1SOL) {
-    // Transfer SOL to WSOL account and sync
-    instructions.push(
-      SystemProgram.transfer({
-        fromPubkey: walletPubkey,
-        toPubkey: token1Account,
-        lamports: amount1Max.toNumber(),
-      }),
-    );
-    instructions.push(createSyncNativeInstruction(token1Account, token1Program));
   }
 
   // Build open position instruction

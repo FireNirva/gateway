@@ -1,8 +1,8 @@
 import { Contract } from '@ethersproject/contracts';
 import { CurrencyAmount, Percent } from '@pancakeswap/sdk';
 import { Position, NonfungiblePositionManager, MintOptions, nearestUsableTick } from '@pancakeswap/v3-sdk';
-import { BigNumber } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { BigNumber, utils } from 'ethers';
+import { FastifyPluginAsync } from 'fastify';
 import { Address } from 'viem';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
@@ -12,9 +12,11 @@ import {
   OpenPositionResponseType,
   OpenPositionResponse,
 } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
 import { Pancakeswap } from '../pancakeswap';
+import { PancakeswapConfig } from '../pancakeswap.config';
 import { getPancakeswapV3NftManagerAddress } from '../pancakeswap.contracts';
 import { formatTokenAmount, getPancakeswapPoolInfo } from '../pancakeswap.utils';
 
@@ -22,7 +24,6 @@ import { formatTokenAmount, getPancakeswapPoolInfo } from '../pancakeswap.utils'
 const CLMM_OPEN_POSITION_GAS_LIMIT = 600000;
 
 export async function openPosition(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   lowerPrice: number,
@@ -30,11 +31,11 @@ export async function openPosition(
   poolAddress: string,
   baseTokenAmount?: number,
   quoteTokenAmount?: number,
-  slippagePct?: number,
+  slippagePct: number = PancakeswapConfig.config.slippagePct,
 ): Promise<OpenPositionResponseType> {
   // Validate essential parameters
   if (!lowerPrice || !upperPrice || !poolAddress || (baseTokenAmount === undefined && quoteTokenAmount === undefined)) {
-    throw fastify.httpErrors.badRequest('Missing required parameters');
+    throw httpErrors.badRequest('Missing required parameters');
   }
 
   // Get Pancakeswap and Ethereum instances
@@ -44,30 +45,30 @@ export async function openPosition(
   // Get pool information to determine tokens
   const poolInfo = await getPancakeswapPoolInfo(poolAddress, network, 'clmm');
   if (!poolInfo) {
-    throw fastify.httpErrors.notFound(sanitizeErrorMessage('Pool not found: {}', poolAddress));
+    throw httpErrors.notFound(sanitizeErrorMessage('Pool not found: {}', poolAddress));
   }
 
-  const baseTokenObj = pancakeswap.getTokenByAddress(poolInfo.baseTokenAddress);
-  const quoteTokenObj = pancakeswap.getTokenByAddress(poolInfo.quoteTokenAddress);
+  const baseTokenObj = await pancakeswap.getToken(poolInfo.baseTokenAddress);
+  const quoteTokenObj = await pancakeswap.getToken(poolInfo.quoteTokenAddress);
 
   if (!baseTokenObj || !quoteTokenObj) {
-    throw fastify.httpErrors.badRequest('Token information not found for pool');
+    throw httpErrors.badRequest('Token information not found for pool');
   }
 
   // Get the wallet
   const wallet = await ethereum.getWallet(walletAddress);
   if (!wallet) {
-    throw fastify.httpErrors.badRequest('Wallet not found');
+    throw httpErrors.badRequest('Wallet not found');
   }
 
   // Get the V3 pool
   const pool = await pancakeswap.getV3Pool(baseTokenObj, quoteTokenObj, undefined, poolAddress);
   if (!pool) {
-    throw fastify.httpErrors.notFound(`Pool not found for ${baseTokenObj.symbol}-${quoteTokenObj.symbol}`);
+    throw httpErrors.notFound(`Pool not found for ${baseTokenObj.symbol}-${quoteTokenObj.symbol}`);
   }
 
   // Calculate slippage tolerance
-  const slippageTolerance = new Percent(Math.floor((slippagePct ?? pancakeswap.config.slippagePct) * 100), 10000);
+  const slippageTolerance = new Percent(Math.floor(slippagePct * 100), 10000);
 
   // Convert price range to ticks
   const token0 = pool.token0;
@@ -95,7 +96,7 @@ export async function openPosition(
 
   // Ensure lower < upper
   if (lowerTick >= upperTick) {
-    throw fastify.httpErrors.badRequest('Lower price must be less than upper price');
+    throw httpErrors.badRequest('Lower price must be less than upper price');
   }
 
   // Calculate token amounts for the position
@@ -103,7 +104,10 @@ export async function openPosition(
   let token1Amount = CurrencyAmount.fromRawAmount(token1, 0);
 
   if (baseTokenAmount !== undefined) {
-    const baseAmountRaw = Math.floor(baseTokenAmount * Math.pow(10, baseTokenObj.decimals));
+    // Use parseUnits to avoid scientific notation issues with large numbers
+    const baseAmountRaw = BigNumber.from(
+      utils.parseUnits(baseTokenAmount.toString(), baseTokenObj.decimals).toString(),
+    );
     if (isBaseToken0) {
       token0Amount = CurrencyAmount.fromRawAmount(token0, baseAmountRaw.toString());
     } else {
@@ -112,7 +116,10 @@ export async function openPosition(
   }
 
   if (quoteTokenAmount !== undefined) {
-    const quoteAmountRaw = Math.floor(quoteTokenAmount * Math.pow(10, quoteTokenObj.decimals));
+    // Use parseUnits to avoid scientific notation issues with large numbers
+    const quoteAmountRaw = BigNumber.from(
+      utils.parseUnits(quoteTokenAmount.toString(), quoteTokenObj.decimals).toString(),
+    );
     if (isBaseToken0) {
       token1Amount = CurrencyAmount.fromRawAmount(token1, quoteAmountRaw.toString());
     } else {
@@ -173,7 +180,7 @@ export async function openPosition(
     logger.info(`${token0.symbol} required: ${formatTokenAmount(requiredAmount0.toString(), token0.decimals)}`);
 
     if (currentAllowance0.lt(requiredAmount0)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token0.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount0.toString(), token0.decimals)} ${token0.symbol} (${token0.address}) for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -195,7 +202,7 @@ export async function openPosition(
     logger.info(`${token1.symbol} required: ${formatTokenAmount(requiredAmount1.toString(), token1.decimals)}`);
 
     if (currentAllowance1.lt(requiredAmount1)) {
-      throw fastify.httpErrors.badRequest(
+      throw httpErrors.badRequest(
         `Insufficient ${token1.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount1.toString(), token1.decimals)} ${token1.symbol} (${token1.address}) for the Position Manager (${positionManagerAddress})`,
       );
     }
@@ -232,7 +239,7 @@ export async function openPosition(
   }
 
   // Wait for transaction confirmation
-  const receipt = await tx.wait();
+  const receipt = await ethereum.handleTransactionExecution(tx);
 
   // Find the NFT ID from the transaction logs
   let positionId = '';
@@ -263,7 +270,7 @@ export async function openPosition(
 
   return {
     signature: receipt.transactionHash,
-    status: 1,
+    status: receipt.status,
     data: {
       fee: gasFee,
       positionAddress: positionId,
@@ -292,15 +299,17 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
           ...OpenPositionRequest,
           properties: {
             ...OpenPositionRequest.properties,
-            network: { type: 'string', default: 'base' },
+            network: { type: 'string', default: 'bsc', examples: ['bsc'] },
             walletAddress: { type: 'string', examples: [walletAddressExample] },
-            lowerPrice: { type: 'number', examples: [1000] },
-            upperPrice: { type: 'number', examples: [4000] },
-            poolAddress: { type: 'string', examples: [''] },
-            baseToken: { type: 'string', examples: ['WETH'] },
-            quoteToken: { type: 'string', examples: ['USDC'] },
-            baseTokenAmount: { type: 'number', examples: [0.001] },
-            quoteTokenAmount: { type: 'number', examples: [3] },
+            lowerPrice: { type: 'number', examples: [0.0008] },
+            upperPrice: { type: 'number', examples: [0.001] },
+            poolAddress: {
+              type: 'string',
+              default: '0x172fcd41e0913e95784454622d1c3724f546f849',
+              examples: ['0x172fcd41e0913e95784454622d1c3724f546f849'],
+            },
+            baseTokenAmount: { type: 'number', examples: [10] },
+            quoteTokenAmount: { type: 'number', examples: [0.01] },
             slippagePct: { type: 'number', examples: [1] },
           },
         },
@@ -327,12 +336,11 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
           const pancakeswap = await Pancakeswap.getInstance(network);
           walletAddress = await pancakeswap.getFirstWalletAddress();
           if (!walletAddress) {
-            throw fastify.httpErrors.badRequest('No wallet address provided and no default wallet found');
+            throw httpErrors.badRequest('No wallet address provided and no default wallet found');
           }
         }
 
         return await openPosition(
-          fastify,
           network,
           walletAddress,
           lowerPrice,
@@ -348,14 +356,14 @@ export const openPositionRoute: FastifyPluginAsync = async (fastify) => {
           throw e;
         }
         if (e.code === 'CALL_EXCEPTION') {
-          throw fastify.httpErrors.badRequest(
+          throw httpErrors.badRequest(
             'Transaction failed. Please check token balances, approvals, and position parameters.',
           );
         }
         if (e.code === 'INSUFFICIENT_FUNDS' || (e.message && e.message.includes('insufficient funds'))) {
-          throw fastify.httpErrors.badRequest('Insufficient funds to complete the transaction');
+          throw httpErrors.badRequest('Insufficient funds to complete the transaction');
         }
-        throw fastify.httpErrors.internalServerError('Failed to open position');
+        throw httpErrors.internalServerError('Failed to open position');
       }
     },
   );

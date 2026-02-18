@@ -15,15 +15,13 @@ export async function getSolanaStatus(fastify: FastifyInstance, network: string)
 
     // Get the actual RPC URL based on provider
     let rpcUrl = solana.config.nodeURL; // Default to nodeURL
-    if (rpcProvider === 'helius') {
-      const heliusService = solana.getHeliusService();
-      if (heliusService) {
-        try {
-          rpcUrl = heliusService.getUrlForNetwork(network);
-        } catch (error) {
-          // If Helius URL generation fails, fall back to nodeURL
-          logger.warn(`Failed to get Helius URL, using nodeURL: ${error.message}`);
-        }
+    const rpcProviderService = solana.getRpcProviderService();
+    if (rpcProviderService) {
+      try {
+        rpcUrl = rpcProviderService.getHttpUrl();
+      } catch (error) {
+        // If provider URL generation fails, fall back to nodeURL
+        logger.warn(`Failed to get RPC provider URL, using nodeURL: ${error.message}`);
       }
     }
 

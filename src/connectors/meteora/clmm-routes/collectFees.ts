@@ -1,14 +1,14 @@
 import { Static } from '@sinclair/typebox';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { Solana } from '../../../chains/solana/solana';
 import { CollectFeesResponse, CollectFeesRequestType, CollectFeesResponseType } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraClmmCollectFeesRequest } from '../schemas';
 
 export async function collectFees(
-  fastify: FastifyInstance,
   network: string,
   address: string,
   positionAddress: string,
@@ -21,9 +21,7 @@ export async function collectFees(
   const positionResult = await meteora.getRawPosition(positionAddress, wallet.publicKey);
 
   if (!positionResult || !positionResult.position) {
-    throw fastify.httpErrors.notFound(
-      `Position not found: ${positionAddress}. Please provide a valid position address`,
-    );
+    throw httpErrors.notFound(`Position not found: ${positionAddress}. Please provide a valid position address`);
   }
 
   // Now safely destructure
@@ -31,7 +29,7 @@ export async function collectFees(
 
   const dlmmPool = await meteora.getDlmmPool(info.publicKey.toBase58());
   if (!dlmmPool) {
-    throw fastify.httpErrors.notFound(`Pool not found for position: ${positionAddress}`);
+    throw httpErrors.notFound(`Pool not found for position: ${positionAddress}`);
   }
 
   const tokenX = await solana.getToken(dlmmPool.tokenX.publicKey.toBase58());
@@ -41,21 +39,37 @@ export async function collectFees(
 
   logger.info(`Collecting fees from position ${positionAddress}`);
 
-  const claimSwapFeeTx = await dlmmPool.claimSwapFee({
+  const claimSwapFeeTxs = await dlmmPool.claimSwapFee({
     owner: wallet.publicKey,
     position: position,
   });
 
-  // Set fee payer for simulation
-  claimSwapFeeTx.feePayer = wallet.publicKey;
+  // Handle array of transactions (SDK v1.7.5 returns Transaction[])
+  const transactions = Array.isArray(claimSwapFeeTxs) ? claimSwapFeeTxs : [claimSwapFeeTxs];
 
-  // Simulate with error handling
-  await solana.simulateWithErrorHandling(claimSwapFeeTx, fastify);
+  // Set fee payer for all transactions
+  transactions.forEach((tx) => {
+    tx.feePayer = wallet.publicKey;
+  });
 
-  logger.info('Transaction simulated successfully, sending to network...');
+  // Simulate and send all transactions
+  let totalFee = 0;
+  let lastSignature = '';
 
-  // Send and confirm transaction using sendAndConfirmTransaction which handles signing
-  const { signature, fee } = await solana.sendAndConfirmTransaction(claimSwapFeeTx, [wallet]);
+  for (const tx of transactions) {
+    // Simulate with error handling
+    await solana.simulateWithErrorHandling(tx);
+
+    logger.info('Transaction simulated successfully, sending to network...');
+
+    // Send and confirm transaction using sendAndConfirmTransaction which handles signing
+    const { signature, fee } = await solana.sendAndConfirmTransaction(tx, [wallet]);
+    lastSignature = signature;
+    totalFee += fee;
+  }
+
+  const signature = lastSignature;
+  const fee = totalFee;
 
   // Get transaction data for confirmation
   const txData = await solana.connection.getTransaction(signature, {
@@ -66,7 +80,7 @@ export async function collectFees(
   const confirmed = txData !== null;
 
   if (confirmed && txData) {
-    const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, dlmmPool.pubkey.toBase58(), [
+    const { balanceChanges } = await solana.extractBalanceChangesAndFee(signature, wallet.publicKey.toBase58(), [
       dlmmPool.tokenX.publicKey.toBase58(),
       dlmmPool.tokenY.publicKey.toBase58(),
     ]);
@@ -118,13 +132,13 @@ export const collectFeesRoute: FastifyPluginAsync = async (fastify) => {
         const { network, walletAddress, positionAddress } = request.body;
         const networkToUse = network;
 
-        return await collectFees(fastify, networkToUse, walletAddress, positionAddress);
+        return await collectFees(networkToUse, walletAddress, positionAddress);
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {
-          throw fastify.httpErrors.createError(e.statusCode, 'Request failed');
+          throw e; // Re-throw HttpErrors with original message
         }
-        throw fastify.httpErrors.internalServerError('Internal server error');
+        throw httpErrors.internalServerError('Internal server error');
       }
     },
   );

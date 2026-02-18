@@ -76,6 +76,10 @@ configurations:
     configurationPath: connectors/raydium.yml
     schemaPath: raydium-schema.json
 
+  $namespace orca:
+    configurationPath: connectors/orca.yml
+    schemaPath: orca-schema.json
+
   $namespace 0x:
     configurationPath: connectors/0x.yml
     schemaPath: 0x-schema.json
@@ -88,11 +92,7 @@ configurations:
     configurationPath: connectors/pancakeswap-sol.yml
     schemaPath: pancakeswap-sol-schema.json
 
-  # RPC providers
-  $namespace helius:
-    configurationPath: rpc/helius.yml
-    schemaPath: helius-schema.json
-
-  $namespace infura:
-    configurationPath: rpc/infura.yml
-    schemaPath: infura-schema.json
+  # API Keys (centralized)
+  $namespace apiKeys:
+    configurationPath: apiKeys.yml
+    schemaPath: apiKeys-schema.json

@@ -1,41 +1,43 @@
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 
 import { ExecuteSwapRequestType, SwapExecuteResponseType, SwapExecuteResponse } from '../../../schemas/router-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
+// eslint-disable-next-line import/order
 import { UniswapExecuteSwapRequest } from '../schemas';
 
 // Import the quote and execute functions
+import { UniswapConfig } from '../uniswap.config';
+
 import { executeQuote } from './executeQuote';
 import { quoteSwap } from './quoteSwap';
 
 async function executeSwap(
-  fastify: FastifyInstance,
   walletAddress: string,
   network: string,
   baseToken: string,
   quoteToken: string,
   amount: number,
   side: 'BUY' | 'SELL',
-  slippagePct: number,
+  slippagePct: number = UniswapConfig.config.slippagePct,
 ): Promise<SwapExecuteResponseType> {
-  logger.info(`Executing swap: ${amount} ${baseToken} ${side} for ${quoteToken}`);
+  try {
+    logger.info(`Executing swap: ${amount} ${baseToken} ${side} for ${quoteToken}`);
 
-  // Step 1: Get quote
-  const quoteResponse = await quoteSwap(
-    fastify,
-    network,
-    walletAddress,
-    baseToken,
-    quoteToken,
-    amount,
-    side,
-    slippagePct,
-  );
+    // Step 1: Get quote
+    const quoteResponse = await quoteSwap(network, walletAddress, baseToken, quoteToken, amount, side, slippagePct);
 
-  // Step 2: Execute the quote
-  const executeResponse = await executeQuote(fastify, walletAddress, network, quoteResponse.quoteId);
+    // Step 2: Execute the quote
+    const executeResponse = await executeQuote(walletAddress, network, quoteResponse.quoteId);
 
-  return executeResponse;
+    return executeResponse;
+  } catch (error: any) {
+    if (error.statusCode) {
+      throw error;
+    }
+    logger.error(`Failed to execute swap: ${error.message}`);
+    throw httpErrors.internalServerError(error.message || 'Failed to execute swap');
+  }
 }
 
 export { executeSwap };
@@ -60,7 +62,6 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           request.body as typeof UniswapExecuteSwapRequest._type;
 
         return await executeSwap(
-          fastify,
           walletAddress,
           network,
           baseToken,
@@ -72,7 +73,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing swap:', e);
-        throw fastify.httpErrors.internalServerError(e.message || 'Internal server error');
+        throw httpErrors.internalServerError(e.message || 'Internal server error');
       }
     },
   );

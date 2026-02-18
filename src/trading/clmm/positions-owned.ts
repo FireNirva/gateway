@@ -1,7 +1,10 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync, FastifyInstance } from 'fastify';
 
+import { getEthereumChainConfig } from '../../chains/ethereum/ethereum.config';
+import { getSolanaChainConfig } from '../../chains/solana/solana.config';
 import { getPositionsOwned as meteoraGetPositionsOwned } from '../../connectors/meteora/clmm-routes/positionsOwned';
+import { getPositionsOwned as orcaGetPositionsOwned } from '../../connectors/orca/clmm-routes/positionsOwned';
 import { getPositionsOwned as pancakeswapGetPositionsOwned } from '../../connectors/pancakeswap/clmm-routes/positionsOwned';
 import { getPositionsOwned as pancakeswapSolGetPositionsOwned } from '../../connectors/pancakeswap-sol/clmm-routes/positionsOwned';
 import { getPositionsOwned as raydiumGetPositionsOwned } from '../../connectors/raydium/clmm-routes/positionsOwned';
@@ -9,24 +12,35 @@ import { getPositionsOwned as uniswapGetPositionsOwned } from '../../connectors/
 import { PositionInfo, PositionInfoSchema } from '../../schemas/clmm-schema';
 import { logger } from '../../services/logger';
 
-// Import positions owned functions from connectors
+// Get default wallet from Solana config, fallback to Ethereum if Solana doesn't exist
+let defaultWallet: string;
+try {
+  const solanaChainConfig = getSolanaChainConfig();
+  defaultWallet = solanaChainConfig.defaultWallet;
+} catch {
+  const ethereumChainConfig = getEthereumChainConfig();
+  defaultWallet = ethereumChainConfig.defaultWallet;
+}
 
 /**
  * Unified positions owned request schema
  */
 const UnifiedPositionsOwnedRequestSchema = Type.Object({
   connector: Type.String({
-    description: 'CLMM connector (raydium, meteora, pancakeswap-sol, uniswap, pancakeswap)',
-    enum: ['raydium', 'meteora', 'pancakeswap-sol', 'uniswap', 'pancakeswap'],
-    default: 'raydium',
+    description: 'CLMM connector (raydium, meteora, pancakeswap-sol, uniswap, pancakeswap, orca)',
+    enum: ['raydium', 'meteora', 'pancakeswap-sol', 'uniswap', 'pancakeswap', 'orca'],
+    default: 'meteora',
+    examples: ['meteora'],
   }),
   chainNetwork: Type.String({
     description: 'Chain and network in format: chain-network (e.g., solana-mainnet-beta, ethereum-mainnet)',
     default: 'solana-mainnet-beta',
+    examples: ['solana-mainnet-beta'],
   }),
   walletAddress: Type.Optional(
     Type.String({
       description: 'Wallet address (optional, uses default wallet if not provided)',
+      default: defaultWallet,
     }),
   ),
 });
@@ -69,6 +83,8 @@ async function getSolanaPositionsOwned(
       return await meteoraGetPositionsOwned(fastify, network, walletAddress);
     case 'pancakeswap-sol':
       return await pancakeswapSolGetPositionsOwned(fastify, network, walletAddress);
+    case 'orca':
+      return await orcaGetPositionsOwned(fastify, network, walletAddress);
     default:
       throw fastify.httpErrors.badRequest(`Unsupported Solana CLMM connector: ${connector}`);
   }

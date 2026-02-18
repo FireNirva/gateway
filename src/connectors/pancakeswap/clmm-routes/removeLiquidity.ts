@@ -2,7 +2,7 @@ import { Contract } from '@ethersproject/contracts';
 import { Percent, CurrencyAmount } from '@pancakeswap/sdk';
 import { NonfungiblePositionManager, Position } from '@pancakeswap/v3-sdk';
 import { BigNumber } from 'ethers';
-import { FastifyPluginAsync, FastifyInstance } from 'fastify';
+import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 import { Address } from 'viem';
 
@@ -13,6 +13,7 @@ import {
   RemoveLiquidityResponseType,
   RemoveLiquidityResponse,
 } from '../../../schemas/clmm-schema';
+import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Pancakeswap } from '../pancakeswap';
 import { POSITION_MANAGER_ABI, getPancakeswapV3NftManagerAddress } from '../pancakeswap.contracts';
@@ -22,25 +23,24 @@ import { formatTokenAmount } from '../pancakeswap.utils';
 const CLMM_REMOVE_LIQUIDITY_GAS_LIMIT = 500000;
 
 export async function removeLiquidity(
-  fastify: FastifyInstance,
   network: string,
   walletAddress: string,
   positionAddress: string,
   percentageToRemove: number,
 ): Promise<RemoveLiquidityResponseType> {
   if (!positionAddress || percentageToRemove === undefined) {
-    throw fastify.httpErrors.badRequest('Missing required parameters');
+    throw httpErrors.badRequest('Missing required parameters');
   }
 
   if (percentageToRemove < 0 || percentageToRemove > 100) {
-    throw fastify.httpErrors.badRequest('Percentage to remove must be between 0 and 100');
+    throw httpErrors.badRequest('Percentage to remove must be between 0 and 100');
   }
 
   const pancakeswap = await Pancakeswap.getInstance(network);
   const ethereum = await Ethereum.getInstance(network);
   const wallet = await ethereum.getWallet(walletAddress);
   if (!wallet) {
-    throw fastify.httpErrors.badRequest('Wallet not found');
+    throw httpErrors.badRequest('Wallet not found');
   }
 
   const positionManagerAddress = getPancakeswapV3NftManagerAddress(network);
@@ -49,16 +49,16 @@ export async function removeLiquidity(
     await pancakeswap.checkNFTOwnership(positionAddress, walletAddress);
   } catch (error: any) {
     if (error.message.includes('is not owned by')) {
-      throw fastify.httpErrors.forbidden(error.message);
+      throw httpErrors.forbidden(error.message);
     }
-    throw fastify.httpErrors.badRequest(error.message);
+    throw httpErrors.badRequest(error.message);
   }
 
   const positionManager = new Contract(positionManagerAddress, POSITION_MANAGER_ABI, ethereum.provider);
   const position = await positionManager.positions(positionAddress);
 
-  const token0 = pancakeswap.getTokenByAddress(position.token0);
-  const token1 = pancakeswap.getTokenByAddress(position.token1);
+  const token0 = await pancakeswap.getToken(position.token0);
+  const token1 = await pancakeswap.getToken(position.token1);
 
   const isBaseToken0 =
     token0.symbol === 'WETH' ||
@@ -67,7 +67,7 @@ export async function removeLiquidity(
   const currentLiquidity = position.liquidity;
   const pool = await pancakeswap.getV3Pool(token0, token1, position.fee);
   if (!pool) {
-    throw fastify.httpErrors.notFound('Pool not found for position');
+    throw httpErrors.notFound('Pool not found for position');
   }
 
   const positionSDK = new Position({
@@ -133,7 +133,7 @@ export async function removeLiquidity(
   const txParams = await ethereum.prepareGasOptions(undefined, CLMM_REMOVE_LIQUIDITY_GAS_LIMIT);
   txParams.value = BigNumber.from(value.toString());
   const tx = await positionManagerWithSigner.multicall([calldata], txParams);
-  const receipt = await tx.wait();
+  const receipt = await ethereum.handleTransactionExecution(tx);
 
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
   const token0AmountRemoved = formatTokenAmount(totalAmount0.quotient.toString(), token0.decimals);
@@ -144,7 +144,7 @@ export async function removeLiquidity(
 
   return {
     signature: receipt.transactionHash,
-    status: 1,
+    status: receipt.status,
     data: {
       fee: gasFee,
       baseTokenAmountRemoved,
@@ -171,7 +171,7 @@ export const removeLiquidityRoute: FastifyPluginAsync = async (fastify) => {
           ...RemoveLiquidityRequest,
           properties: {
             ...RemoveLiquidityRequest.properties,
-            network: { type: 'string', default: 'base' },
+            network: { type: 'string', default: 'bsc', examples: ['bsc'] },
             walletAddress: { type: 'string', examples: [walletAddressExample] },
             positionAddress: {
               type: 'string',
@@ -200,17 +200,17 @@ export const removeLiquidityRoute: FastifyPluginAsync = async (fastify) => {
           const pancakeswap = await Pancakeswap.getInstance(network);
           walletAddress = await pancakeswap.getFirstWalletAddress();
           if (!walletAddress) {
-            throw fastify.httpErrors.badRequest('No wallet address provided and no default wallet found');
+            throw httpErrors.badRequest('No wallet address provided and no default wallet found');
           }
         }
 
-        return await removeLiquidity(fastify, network, walletAddress, positionAddress, percentageToRemove);
+        return await removeLiquidity(network, walletAddress, positionAddress, percentageToRemove);
       } catch (e: any) {
         logger.error('Failed to remove liquidity:', e);
         if (e.statusCode) {
           throw e;
         }
-        throw fastify.httpErrors.internalServerError('Failed to remove liquidity');
+        throw httpErrors.internalServerError('Failed to remove liquidity');
       }
     },
   );

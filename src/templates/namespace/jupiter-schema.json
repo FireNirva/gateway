@@ -24,7 +24,7 @@
     },
     "apiKey": {
       "type": "string",
-      "description": "Jupiter API key for paid plans. Leave empty for free tier."
+      "description": "Jupiter API key for Solana DEX (https://portal.jup.ag)"
     }
   },
   "additionalProperties": false,

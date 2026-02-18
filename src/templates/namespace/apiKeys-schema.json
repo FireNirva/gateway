@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "helius": {
+      "type": "string",
+      "description": "Helius API key for Solana RPC (https://helius.dev)"
+    },
+    "infura": {
+      "type": "string",
+      "description": "Infura API key for Ethereum RPC (https://infura.io)"
+    },
+    "coingecko": {
+      "type": "string",
+      "description": "CoinGecko API key for price data (https://www.coingecko.com/en/api/pricing)"
+    },
+    "etherscan": {
+      "type": "string",
+      "description": "Etherscan API key for gas prices (https://etherscan.io/myapikey)"
+    }
+  },
+  "additionalProperties": true
+}

@@ -59,6 +59,7 @@ describe('Token Routes', () => {
     it('should return tokens when chain and network specified', async () => {
       const mockTokens = [
         {
+          chainId: 1,
           name: 'USD Coin',
           symbol: 'USDC',
           address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
@@ -104,6 +105,7 @@ describe('Token Routes', () => {
   describe('GET /tokens/:symbolOrAddress', () => {
     it('should return token when found', async () => {
       const mockToken = {
+        chainId: 1,
         name: 'USD Coin',
         symbol: 'USDC',
         address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
@@ -143,6 +145,7 @@ describe('Token Routes', () => {
   describe('POST /tokens', () => {
     it('should add token successfully', async () => {
       const mockToken = {
+        chainId: 1,
         name: 'Test Token',
         symbol: 'TEST',
         address: '0x1234567890123456789012345678901234567890',
@@ -164,10 +167,7 @@ describe('Token Routes', () => {
 
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
-      expect(body).toEqual({
-        message: 'Token TEST added/updated successfully in ethereum/mainnet. Gateway restart required.',
-        requiresRestart: true,
-      });
+      expect(body.message).toBe('Token TEST added/updated successfully in ethereum/mainnet.');
     });
 
     it('should return 400 for invalid token data', async () => {
@@ -192,6 +192,7 @@ describe('Token Routes', () => {
       (mockService.addToken as jest.Mock).mockResolvedValue(undefined);
 
       const updatedToken = {
+        chainId: 1,
         symbol: 'TEST',
         name: 'Updated Test Token',
         address: '0xNewAddress1234567890123456789012345678',
@@ -210,10 +211,7 @@ describe('Token Routes', () => {
 
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
-      expect(body).toEqual({
-        message: 'Token TEST added/updated successfully in ethereum/mainnet. Gateway restart required.',
-        requiresRestart: true,
-      });
+      expect(body.message).toBe('Token TEST added/updated successfully in ethereum/mainnet.');
     });
   });
 
@@ -229,11 +227,9 @@ describe('Token Routes', () => {
 
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
-      expect(body).toEqual({
-        message:
-          'Token with address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 removed successfully from ethereum/mainnet. Gateway restart required.',
-        requiresRestart: true,
-      });
+      expect(body.message).toBe(
+        'Token with address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 removed successfully from ethereum/mainnet.',
+      );
     });
 
     it('should return 404 when token not found', async () => {
