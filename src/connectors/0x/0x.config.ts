@@ -26,24 +26,13 @@ export namespace ZeroXConfig {
   };
 
   export const getApiEndpoint = (network: string): string => {
-    // Only include supported networks
-    const networkMap: Record<string, string> = {
-      mainnet: 'api.0x.org',
-      arbitrum: 'arbitrum.api.0x.org',
-      avalanche: 'avalanche.api.0x.org',
-      base: 'base.api.0x.org',
-      bsc: 'bsc.api.0x.org',
-      optimism: 'optimism.api.0x.org',
-      polygon: 'polygon.api.0x.org',
-    };
-
-    const endpoint = networkMap[network];
-    if (!endpoint) {
+    if (!ZeroXConfig.networks.includes(network)) {
       throw new Error(
-        `0x API endpoint not found for network: ${network}. Supported networks: ${Object.keys(networkMap).join(', ')}`,
+        `0x API endpoint not found for network: ${network}. Supported networks: ${ZeroXConfig.networks.join(', ')}`,
       );
     }
 
-    return `https://${endpoint}`;
+    // 0x Swap API v2 uses a single global hostname and routes by chainId.
+    return 'https://api.0x.org';
   };
 }

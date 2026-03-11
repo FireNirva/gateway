@@ -1,4 +1,5 @@
 import { Static } from '@sinclair/typebox';
+import { BigNumber } from 'ethers';
 import { FastifyPluginAsync } from 'fastify';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -11,6 +12,156 @@ import { sanitizeErrorMessage } from '../../../services/sanitize';
 import { ZeroX } from '../0x';
 import { ZeroXConfig } from '../0x.config';
 import { ZeroXQuoteSwapRequest, ZeroXQuoteSwapResponse } from '../schemas';
+
+const BUY_SEARCH_MAX_DOUBLINGS = 12;
+const BUY_SEARCH_MAX_ADJUSTMENTS = 4;
+const BUY_ADJUSTMENT_BUFFER_BPS = 10;
+const BUY_ACCEPTABLE_OVERSHOOT_BPS = 10;
+const INDICATIVE_CACHE_TTL_MS = 1500;
+
+const indicativeQuoteCache = new Map<string, { expiresAt: number; response: Static<typeof ZeroXQuoteSwapResponse> }>();
+const inFlightIndicativeQuotes = new Map<string, Promise<Static<typeof ZeroXQuoteSwapResponse>>>();
+
+async function getExactInputResponse(
+  zeroX: ZeroX,
+  indicativePrice: boolean,
+  sellToken: string,
+  buyToken: string,
+  sellAmount: string,
+  walletAddress: string,
+  slippagePct: number,
+): Promise<any> {
+  const requestParams = {
+    sellToken,
+    buyToken,
+    sellAmount,
+    takerAddress: walletAddress,
+    slippagePercentage: slippagePct / 100,
+    skipValidation: indicativePrice,
+  };
+
+  if (indicativePrice) {
+    return zeroX.getPrice(requestParams);
+  }
+
+  return zeroX.getQuote(requestParams);
+}
+
+async function getBuySideResponse(
+  zeroX: ZeroX,
+  indicativePrice: boolean,
+  baseTokenAddress: string,
+  quoteTokenAddress: string,
+  amount: number,
+  baseDecimals: number,
+  walletAddress: string,
+  slippagePct: number,
+): Promise<any> {
+  const targetBuyAmount = BigNumber.from(zeroX.parseTokenAmount(amount, baseDecimals));
+
+  // Estimate the quote token spend by valuing the same base size on the sell side first.
+  const sellSideEstimate = await getExactInputResponse(
+    zeroX,
+    true,
+    baseTokenAddress,
+    quoteTokenAddress,
+    targetBuyAmount.toString(),
+    walletAddress,
+    slippagePct,
+  );
+
+  let currentSellAmount = BigNumber.from(sellSideEstimate.buyAmount || '0');
+  if (currentSellAmount.lte(0)) {
+    currentSellAmount = BigNumber.from(1);
+  }
+
+  let currentResponse = await getExactInputResponse(
+    zeroX,
+    indicativePrice,
+    quoteTokenAddress,
+    baseTokenAddress,
+    currentSellAmount.toString(),
+    walletAddress,
+    slippagePct,
+  );
+  let currentBuyAmount = BigNumber.from(currentResponse.buyAmount);
+
+  let doublings = 0;
+  while (currentBuyAmount.lt(targetBuyAmount)) {
+    currentSellAmount = currentSellAmount.mul(2);
+    currentResponse = await getExactInputResponse(
+      zeroX,
+      indicativePrice,
+      quoteTokenAddress,
+      baseTokenAddress,
+      currentSellAmount.toString(),
+      walletAddress,
+      slippagePct,
+    );
+    currentBuyAmount = BigNumber.from(currentResponse.buyAmount);
+    doublings += 1;
+    if (doublings >= BUY_SEARCH_MAX_DOUBLINGS) {
+      throw new Error(`0x could not source enough liquidity to buy ${amount} base tokens.`);
+    }
+  }
+
+  let bestResponse = currentResponse;
+  let bestSellAmount = currentSellAmount;
+
+  for (let step = 0; step < BUY_SEARCH_MAX_ADJUSTMENTS; step += 1) {
+    const overshootAmount = currentBuyAmount.gte(targetBuyAmount)
+      ? currentBuyAmount.sub(targetBuyAmount)
+      : BigNumber.from(0);
+    const acceptableOvershoot = targetBuyAmount.mul(BUY_ACCEPTABLE_OVERSHOOT_BPS).div(10000);
+    if (overshootAmount.gte(0) && overshootAmount.lte(acceptableOvershoot)) {
+      return currentResponse;
+    }
+
+    let adjustedSellAmount = currentSellAmount.mul(targetBuyAmount).div(currentBuyAmount);
+
+    if (currentBuyAmount.lt(targetBuyAmount)) {
+      adjustedSellAmount = adjustedSellAmount.mul(10000 + BUY_ADJUSTMENT_BUFFER_BPS).div(10000);
+    }
+
+    if (adjustedSellAmount.lte(0)) {
+      adjustedSellAmount = BigNumber.from(1);
+    }
+
+    if (adjustedSellAmount.eq(currentSellAmount)) {
+      adjustedSellAmount = currentBuyAmount.lt(targetBuyAmount)
+        ? currentSellAmount.add(1)
+        : currentSellAmount.gt(1)
+          ? currentSellAmount.sub(1)
+          : currentSellAmount;
+    }
+
+    if (adjustedSellAmount.lte(0)) {
+      break;
+    }
+
+    const adjustedResponse = await getExactInputResponse(
+      zeroX,
+      indicativePrice,
+      quoteTokenAddress,
+      baseTokenAddress,
+      adjustedSellAmount.toString(),
+      walletAddress,
+      slippagePct,
+    );
+    const adjustedBuyAmount = BigNumber.from(adjustedResponse.buyAmount);
+
+    if (adjustedBuyAmount.gte(targetBuyAmount) && adjustedSellAmount.lt(bestSellAmount)) {
+      bestResponse = adjustedResponse;
+      bestSellAmount = adjustedSellAmount;
+    }
+
+    currentSellAmount = adjustedSellAmount;
+    currentResponse = adjustedResponse;
+    currentBuyAmount = adjustedBuyAmount;
+  }
+
+  return bestResponse;
+}
 
 async function quoteSwap(
   network: string,
@@ -37,12 +188,8 @@ async function quoteSwap(
   const sellToken = side === 'SELL' ? baseTokenInfo.address : quoteTokenInfo.address;
   const buyToken = side === 'SELL' ? quoteTokenInfo.address : baseTokenInfo.address;
 
-  // For BUY side, amount is in base token (what we're buying), but we need to convert it for the API
-  // For SELL side, amount is in base token (what we're selling)
-  const amountDecimals = baseTokenInfo.decimals; // amount is always in base token units
-
-  // Convert amount to token units - this will be used differently based on side
-  const tokenAmount = zeroX.parseTokenAmount(amount, amountDecimals);
+  // Hummingbot router semantics always express `amount` in base token units.
+  const tokenAmount = zeroX.parseTokenAmount(amount, baseTokenInfo.decimals);
 
   // Use provided taker address or example
   const walletAddress = takerAddress || (await Ethereum.getWalletAddressExample());
@@ -54,45 +201,51 @@ async function quoteSwap(
   // Get quote or price from 0x API based on indicativePrice flag
   let apiResponse: any;
   if (indicativePrice) {
-    // Use price API for indicative quotes (no commitment)
-    const priceParams: any = {
-      sellToken,
-      buyToken,
-      takerAddress: walletAddress,
-      slippagePercentage: slippagePct / 100, // Convert to percentage
-      skipValidation: true, // Always skip validation for price quotes
-    };
-
-    // Only add the amount parameter that we're using
-    // For SELL: we're selling the base token, so use sellAmount
-    // For BUY: we're buying the base token, so use buyAmount
     if (side === 'SELL') {
-      priceParams.sellAmount = tokenAmount;
+      apiResponse = await getExactInputResponse(
+        zeroX,
+        true,
+        sellToken,
+        buyToken,
+        tokenAmount,
+        walletAddress,
+        slippagePct,
+      );
     } else {
-      priceParams.buyAmount = tokenAmount;
+      apiResponse = await getBuySideResponse(
+        zeroX,
+        true,
+        baseTokenInfo.address,
+        quoteTokenInfo.address,
+        amount,
+        baseTokenInfo.decimals,
+        walletAddress,
+        slippagePct,
+      );
     }
-
-    apiResponse = await zeroX.getPrice(priceParams);
   } else {
-    // Use quote API for firm quotes (with commitment)
-    const quoteParams: any = {
-      sellToken,
-      buyToken,
-      takerAddress: walletAddress,
-      slippagePercentage: slippagePct / 100, // Convert to percentage
-      skipValidation: false,
-    };
-
-    // Only add the amount parameter that we're using
-    // For SELL: we're selling the base token, so use sellAmount
-    // For BUY: we're buying the base token, so use buyAmount
     if (side === 'SELL') {
-      quoteParams.sellAmount = tokenAmount;
+      apiResponse = await getExactInputResponse(
+        zeroX,
+        false,
+        sellToken,
+        buyToken,
+        tokenAmount,
+        walletAddress,
+        slippagePct,
+      );
     } else {
-      quoteParams.buyAmount = tokenAmount;
+      apiResponse = await getBuySideResponse(
+        zeroX,
+        false,
+        baseTokenInfo.address,
+        quoteTokenInfo.address,
+        amount,
+        baseTokenInfo.decimals,
+        walletAddress,
+        slippagePct,
+      );
     }
-
-    apiResponse = await zeroX.getQuote(quoteParams);
   }
 
   // Parse amounts
@@ -107,7 +260,7 @@ async function quoteSwap(
   const maxAmountIn = side === 'BUY' ? estimatedAmountIn * (1 + slippagePct / 100) : amount;
 
   // Calculate price based on side
-  const price = side === 'SELL' ? estimatedAmountOut / estimatedAmountIn : estimatedAmountIn / estimatedAmountOut;
+  const price = side === 'SELL' ? estimatedAmountOut / estimatedAmountIn : estimatedAmountIn / amount;
 
   // Parse price impact
   const priceImpactPct = apiResponse.estimatedPriceImpact ? parseFloat(apiResponse.estimatedPriceImpact) * 100 : 0;
@@ -167,6 +320,26 @@ async function quoteSwap(
 
 export { quoteSwap };
 
+function getIndicativeQuoteCacheKey(
+  network: string,
+  baseToken: string,
+  quoteToken: string,
+  amount: number,
+  side: 'BUY' | 'SELL',
+  slippagePct: number,
+  takerAddress?: string,
+): string {
+  return JSON.stringify({
+    network,
+    baseToken,
+    quoteToken,
+    amount,
+    side,
+    slippagePct,
+    takerAddress: takerAddress || '',
+  });
+}
+
 export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
   fastify.get<{
     Querystring: QuoteSwapRequestType;
@@ -186,6 +359,52 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
       try {
         const { network, baseToken, quoteToken, amount, side, slippagePct, indicativePrice, takerAddress } =
           request.query as typeof ZeroXQuoteSwapRequest._type;
+        const useIndicativePrice = indicativePrice ?? true;
+        if (useIndicativePrice) {
+          const cacheKey = getIndicativeQuoteCacheKey(
+            network,
+            baseToken,
+            quoteToken,
+            amount,
+            side as 'BUY' | 'SELL',
+            slippagePct ?? ZeroXConfig.config.slippagePct,
+            takerAddress,
+          );
+          const now = Date.now();
+          const cached = indicativeQuoteCache.get(cacheKey);
+          if (cached && cached.expiresAt > now) {
+            return cached.response;
+          }
+
+          const inFlight = inFlightIndicativeQuotes.get(cacheKey);
+          if (inFlight) {
+            return await inFlight;
+          }
+
+          const quotePromise = quoteSwap(
+            network,
+            baseToken,
+            quoteToken,
+            amount,
+            side as 'BUY' | 'SELL',
+            slippagePct,
+            useIndicativePrice,
+            takerAddress,
+          )
+            .then((response) => {
+              indicativeQuoteCache.set(cacheKey, {
+                expiresAt: Date.now() + INDICATIVE_CACHE_TTL_MS,
+                response,
+              });
+              return response;
+            })
+            .finally(() => {
+              inFlightIndicativeQuotes.delete(cacheKey);
+            });
+
+          inFlightIndicativeQuotes.set(cacheKey, quotePromise);
+          return await quotePromise;
+        }
 
         return await quoteSwap(
           network,
@@ -194,7 +413,7 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
           amount,
           side as 'BUY' | 'SELL',
           slippagePct,
-          indicativePrice ?? true,
+          useIndicativePrice,
           takerAddress,
         );
       } catch (e: any) {
