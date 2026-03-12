@@ -7,3 +7,11 @@ slippagePct: 1
 # API key for 0x API (required)
 # Get your API key from https://dashboard.0x.org
 apiKey: ''
+
+# Global request shaping for 0x API calls from Gateway.
+requestRateLimit:
+  maxConcurrent: 1
+  minDelay: 1000
+
+# Local cooldown after a vendor throttle response (ms).
+throttleBackoffMs: 60000

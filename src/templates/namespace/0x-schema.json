@@ -43,6 +43,27 @@
       "description": "Request timeout for API calls (ms)",
       "minimum": 0
     },
+    "requestRateLimit": {
+      "type": "object",
+      "properties": {
+        "maxConcurrent": {
+          "type": "integer",
+          "description": "Maximum number of in-flight 0x API requests",
+          "minimum": 1
+        },
+        "minDelay": {
+          "type": "integer",
+          "description": "Minimum delay between 0x API requests (ms)",
+          "minimum": 0
+        }
+      },
+      "required": ["maxConcurrent", "minDelay"]
+    },
+    "throttleBackoffMs": {
+      "type": "integer",
+      "description": "Cooldown after a 0x vendor throttle response (ms)",
+      "minimum": 0
+    },
     "enableLogging": {
       "type": "boolean",
       "description": "Enable/disable request logging"
