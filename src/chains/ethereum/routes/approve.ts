@@ -245,8 +245,8 @@ export async function approveEthereumToken(
         'function approve(address token, address spender, uint160 amount, uint48 expiration) external',
       ];
 
-      // Calculate expiration (48 hours from now)
-      const expiration = Math.floor(Date.now() / 1000) + 48 * 60 * 60;
+      // Calculate expiration (30 days from now) for Universal Router Permit2 approvals.
+      const expiration = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
       // Convert amount to uint160 (Permit2 uses uint160 for amounts)
       // Max uint160 is 2^160 - 1, which is smaller than uint256
