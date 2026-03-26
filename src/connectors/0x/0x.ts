@@ -171,9 +171,8 @@ export class ZeroX {
   private activateThrottleBackoff(error: any): void {
     const retryAfterHeader = error?.response?.headers?.['retry-after'];
     const retryAfterSeconds = Number.parseInt(retryAfterHeader ?? '', 10);
-    const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-      ? retryAfterSeconds * 1000
-      : this.throttleBackoffMs;
+    const backoffMs =
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds * 1000 : this.throttleBackoffMs;
     const currentThrottleUntil = ZeroX.throttleUntilByNetwork.get(this.network) || 0;
     const nextThrottleUntil = Math.max(currentThrottleUntil, Date.now() + backoffMs);
     ZeroX.throttleUntilByNetwork.set(this.network, nextThrottleUntil);

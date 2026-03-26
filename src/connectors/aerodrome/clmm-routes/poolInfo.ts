@@ -18,11 +18,11 @@ import { AerodromeClmmGetPoolInfoRequest } from '../schemas';
 import { SlipstreamPool } from '../slipstream-sdk';
 
 export async function getPoolInfo(fastify: FastifyInstance, network: string, poolAddress: string): Promise<PoolInfo> {
-  const aerodrome = await Aerodrome.getInstance(network);
-
   if (!poolAddress) {
     throw fastify.httpErrors.badRequest('Pool address is required');
   }
+
+  const aerodrome = await Aerodrome.getInstance(network);
 
   // Get pool token addresses
   const poolInfo = await getAerodromePoolInfo(poolAddress, network);
@@ -103,6 +103,7 @@ export const poolInfoRoute: FastifyPluginAsync = async (fastify) => {
       try {
         const { poolAddress } = request.query;
         const network = request.query.network;
+        logger.info(`Aerodrome pool-info request: network=${network}, poolAddress=${poolAddress}`);
         return await getPoolInfo(fastify, network, poolAddress);
       } catch (e) {
         logger.error(e);

@@ -11,6 +11,7 @@ import {
 } from '../../../schemas/clmm-schema';
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
+import { PoolService } from '../../../services/pool-service';
 import { sanitizeErrorMessage } from '../../../services/sanitize';
 import { Aerodrome } from '../aerodrome';
 import { AerodromeConfig } from '../aerodrome.config';
@@ -139,7 +140,23 @@ export const quoteSwapRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { network, poolAddress, baseToken, quoteToken, amount, side, slippagePct } = request.query;
+        const { network, baseToken, quoteToken, amount, side, slippagePct } = request.query;
+        let { poolAddress } = request.query;
+
+        // Auto-resolve pool address from pool storage if not provided
+        if (!poolAddress) {
+          const poolService = PoolService.getInstance();
+          const pool = await poolService.getPool('aerodrome', network || 'base', 'clmm', baseToken, quoteToken);
+          if (pool) {
+            poolAddress = pool.address;
+            logger.info(`Auto-resolved pool address for ${baseToken}/${quoteToken}: ${poolAddress}`);
+          } else {
+            throw httpErrors.badRequest(
+              `Pool address is required — no registered pool found for ${baseToken}/${quoteToken}`,
+            );
+          }
+        }
+
         const { quote } = await getAerodromeClmmQuote(
           network,
           poolAddress,
