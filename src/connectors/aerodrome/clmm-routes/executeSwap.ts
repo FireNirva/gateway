@@ -45,8 +45,8 @@ export async function executeClmmSwap(
   const exactIn = side === 'SELL';
   const [inputToken, outputToken] = exactIn ? [baseTokenObj, quoteTokenObj] : [quoteTokenObj, baseTokenObj];
 
-  const amountIn = utils.parseUnits(amount.toString(), inputToken.decimals);
-  const amountOutMinimum = utils.parseUnits(quote.minAmountOut.toString(), outputToken.decimals);
+  const amountIn = utils.parseUnits(amount.toFixed(inputToken.decimals), inputToken.decimals);
+  const amountOutMinimum = utils.parseUnits(quote.minAmountOut.toFixed(outputToken.decimals), outputToken.decimals);
 
   const contracts = aerodrome.getContracts();
   const tickSpacing = await getTickSpacing(poolAddress, network);
