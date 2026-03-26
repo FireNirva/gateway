@@ -1,9 +1,6 @@
 import { Contract } from '@ethersproject/contracts';
-import { Percent, CurrencyAmount } from '@uniswap/sdk-core';
-import { NonfungiblePositionManager, Position } from '@uniswap/v3-sdk';
-import { BigNumber } from 'ethers';
+import { BigNumber, utils } from 'ethers';
 import { FastifyPluginAsync } from 'fastify';
-import JSBI from 'jsbi';
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import {
@@ -15,10 +12,20 @@ import {
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount } from '../aerodrome.utils';
-import { SlipstreamPool } from '../slipstream-sdk';
+import { formatTokenAmount } from '../aerodrome.utils';
 
-const CLMM_CLOSE_POSITION_GAS_LIMIT = 400000;
+const CLMM_CLOSE_POSITION_GAS_LIMIT = 500000;
+
+// Standard NFT Position Manager ABI for close operations
+const NPM_ABI = [
+  'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
+  'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
+  'function burn(uint256 tokenId)',
+  'function multicall(bytes[] data) payable returns (bytes[] results)',
+];
+
+const MAX_UINT128 = BigNumber.from(2).pow(128).sub(1);
 
 export async function closePosition(
   network: string,
@@ -37,36 +44,34 @@ export async function closePosition(
     throw httpErrors.badRequest('Wallet not found');
   }
 
-  const nftManager = aerodrome.getNftManager();
   const contracts = aerodrome.getContracts();
+  const nftManagerAddress = contracts.nftPositionManager;
 
-  // If staked in gauge, withdraw first (auto-collects fees + rewards)
-  const position = await nftManager.positions(positionAddress);
-  const token0Address = position.token0;
-  const token1Address = position.token1;
-  const tickSpacing = position.tickSpacing;
+  const nftManagerContract = new Contract(nftManagerAddress, NPM_ABI, wallet);
 
-  // Try to find pool and unstake from gauge
+  // Read position
+  const position = await nftManagerContract.positions(positionAddress);
+  const token0Address: string = position.token0;
+  const token1Address: string = position.token1;
+  const tickSpacingVal: number = position.tickSpacing;
+
+  // Try to unstake from gauge first
   try {
     const factory = aerodrome.getFactory();
-    const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacing);
+    const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacingVal);
     const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
 
     if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
       const gauge = aerodrome.getGaugeContract(gaugeAddress);
       const gaugeWithSigner = gauge.connect(wallet);
 
-      // Check if staked
       try {
-        const isStaked = await gaugeWithSigner.stakedContains(positionAddress);
-        if (isStaked) {
-          // withdraw() auto-collects both fees AND rewards
-          const withdrawTx = await gaugeWithSigner.withdraw(positionAddress);
-          await ethereum.handleTransactionExecution(withdrawTx);
-          logger.info(`Position ${positionAddress} unstaked from gauge ${gaugeAddress}`);
-        }
+        // Try withdraw directly — if not staked, it reverts and we catch it
+        const withdrawTx = await gaugeWithSigner.withdraw(positionAddress);
+        await ethereum.handleTransactionExecution(withdrawTx);
+        logger.info(`Position ${positionAddress} unstaked from gauge ${gaugeAddress}`);
       } catch (err) {
-        logger.warn(`Gauge unstake check failed (may not be staked): ${(err as Error).message}`);
+        logger.warn(`Gauge withdraw failed (may not be staked): ${(err as Error).message}`);
       }
     }
   } catch (err) {
@@ -74,7 +79,13 @@ export async function closePosition(
   }
 
   // Re-read position after potential gauge withdrawal
-  const positionDetails = await nftManager.positions(positionAddress);
+  const positionDetails = await nftManagerContract.positions(positionAddress);
+  const currentLiquidity: BigNumber = positionDetails.liquidity;
+
+  if (currentLiquidity.isZero() && positionDetails.tokensOwed0.isZero() && positionDetails.tokensOwed1.isZero()) {
+    throw httpErrors.badRequest('Position has already been closed or has no liquidity/fees to collect');
+  }
+
   const token0 = await aerodrome.getTokenBySymbol(positionDetails.token0);
   const token1 = await aerodrome.getTokenBySymbol(positionDetails.token1);
 
@@ -82,101 +93,74 @@ export async function closePosition(
     token0.symbol === 'WETH' ||
     (token1.symbol !== 'WETH' && token0.address.toLowerCase() < token1.address.toLowerCase());
 
-  const currentLiquidity = positionDetails.liquidity;
+  // Build multicall: decreaseLiquidity + collect + burn
+  const iface = new utils.Interface(NPM_ABI);
+  const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
 
-  if (currentLiquidity.isZero() && positionDetails.tokensOwed0.isZero() && positionDetails.tokensOwed1.isZero()) {
-    throw httpErrors.badRequest('Position has already been closed or has no liquidity/fees to collect');
+  const calldatas: string[] = [];
+
+  // 1. decreaseLiquidity — remove all liquidity, accept any output (slippage handled by min amounts = 0)
+  if (!currentLiquidity.isZero()) {
+    calldatas.push(
+      iface.encodeFunctionData('decreaseLiquidity', [
+        {
+          tokenId: positionAddress,
+          liquidity: currentLiquidity,
+          amount0Min: 0,
+          amount1Min: 0,
+          deadline,
+        },
+      ]),
+    );
   }
 
-  const feeAmount0 = positionDetails.tokensOwed0;
-  const feeAmount1 = positionDetails.tokensOwed1;
-
-  // Build SlipstreamPool
-  const factory = aerodrome.getFactory();
-  const poolAddress = await factory.getPool(
-    positionDetails.token0,
-    positionDetails.token1,
-    positionDetails.tickSpacing,
-  );
-
-  const [slot0, dynamicFee, poolLiquidity] = await Promise.all([
-    getSlot0(poolAddress, network),
-    getDynamicFee(poolAddress, network),
-    getPoolLiquidity(poolAddress, network),
-  ]);
-
-  const pool = new SlipstreamPool(
-    token0,
-    token1,
-    dynamicFee,
-    JSBI.BigInt(slot0.sqrtPriceX96.toString()),
-    JSBI.BigInt(poolLiquidity.toString()),
-    slot0.tick,
-    positionDetails.tickSpacing,
-  );
-
-  const positionSDK = new Position({
-    pool,
-    tickLower: positionDetails.tickLower,
-    tickUpper: positionDetails.tickUpper,
-    liquidity: currentLiquidity.toString(),
-  });
-
-  const amount0 = positionSDK.amount0;
-  const amount1 = positionSDK.amount1;
-
-  const slippageTolerance = new Percent(100, 10000);
-
-  const totalAmount0 = CurrencyAmount.fromRawAmount(
-    token0,
-    JSBI.add(amount0.quotient, JSBI.BigInt(feeAmount0.toString())),
-  );
-  const totalAmount1 = CurrencyAmount.fromRawAmount(
-    token1,
-    JSBI.add(amount1.quotient, JSBI.BigInt(feeAmount1.toString())),
-  );
-
-  const removeParams = {
-    tokenId: positionAddress,
-    liquidityPercentage: new Percent(10000, 10000),
-    slippageTolerance,
-    deadline: Math.floor(Date.now() / 1000) + 60 * 20,
-    burnToken: true,
-    collectOptions: {
-      expectedCurrencyOwed0: totalAmount0,
-      expectedCurrencyOwed1: totalAmount1,
-      recipient: walletAddress,
-    },
-  };
-
-  const { calldata, value } = NonfungiblePositionManager.removeCallParameters(positionSDK, removeParams);
-
-  const nftManagerWithSigner = new Contract(
-    contracts.nftPositionManager,
-    [
+  // 2. collect — collect all tokens + fees
+  calldatas.push(
+    iface.encodeFunctionData('collect', [
       {
-        inputs: [{ internalType: 'bytes[]', name: 'data', type: 'bytes[]' }],
-        name: 'multicall',
-        outputs: [{ internalType: 'bytes[]', name: 'results', type: 'bytes[]' }],
-        stateMutability: 'payable',
-        type: 'function',
+        tokenId: positionAddress,
+        recipient: walletAddress,
+        amount0Max: MAX_UINT128,
+        amount1Max: MAX_UINT128,
       },
-    ],
-    wallet,
+    ]),
+  );
+
+  // 3. burn — burn the NFT
+  calldatas.push(iface.encodeFunctionData('burn', [positionAddress]));
+
+  logger.info(
+    `Closing position ${positionAddress}: liquidity=${currentLiquidity.toString()}, multicall with ${calldatas.length} operations`,
   );
 
   const txParams = await ethereum.prepareGasOptions(undefined, CLMM_CLOSE_POSITION_GAS_LIMIT);
-  txParams.value = BigNumber.from(value.toString());
+  txParams.value = BigNumber.from(0);
 
-  const tx = await nftManagerWithSigner.multicall([calldata], txParams);
+  const tx = await nftManagerContract.multicall(calldatas, txParams);
   const receipt = await ethereum.handleTransactionExecution(tx);
 
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
 
-  const token0AmountRemoved = formatTokenAmount(totalAmount0.quotient.toString(), token0.decimals);
-  const token1AmountRemoved = formatTokenAmount(totalAmount1.quotient.toString(), token1.decimals);
-  const token0FeeAmount = formatTokenAmount(feeAmount0.toString(), token0.decimals);
-  const token1FeeAmount = formatTokenAmount(feeAmount1.toString(), token1.decimals);
+  // Parse collected amounts from Collect event logs
+  let amount0Collected = BigNumber.from(0);
+  let amount1Collected = BigNumber.from(0);
+
+  for (const log of receipt.logs) {
+    try {
+      const parsed = iface.parseLog(log);
+      if (parsed.name === 'collect' || parsed.name === 'Collect') {
+        amount0Collected = parsed.args.amount0 || parsed.args[4];
+        amount1Collected = parsed.args.amount1 || parsed.args[5];
+      }
+    } catch {
+      // Not our event
+    }
+  }
+
+  const token0AmountRemoved = formatTokenAmount(amount0Collected.toString(), token0.decimals);
+  const token1AmountRemoved = formatTokenAmount(amount1Collected.toString(), token1.decimals);
+  const token0FeeAmount = formatTokenAmount(positionDetails.tokensOwed0.toString(), token0.decimals);
+  const token1FeeAmount = formatTokenAmount(positionDetails.tokensOwed1.toString(), token1.decimals);
 
   const baseTokenAmountRemoved = isBaseToken0 ? token0AmountRemoved : token1AmountRemoved;
   const quoteTokenAmountRemoved = isBaseToken0 ? token1AmountRemoved : token0AmountRemoved;
@@ -225,6 +209,11 @@ export const closePositionRoute: FastifyPluginAsync = async (fastify) => {
         logger.error('Failed to close position:', e);
         if (e.statusCode) {
           throw e;
+        }
+        if (e.code === 'CALL_EXCEPTION') {
+          throw httpErrors.badRequest(
+            'Transaction failed. Please check that the position exists and is owned by this wallet.',
+          );
         }
         throw httpErrors.internalServerError('Failed to close position');
       }
