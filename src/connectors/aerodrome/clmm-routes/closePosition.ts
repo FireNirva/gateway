@@ -16,13 +16,15 @@ import { formatTokenAmount } from '../aerodrome.utils';
 
 const CLMM_CLOSE_POSITION_GAS_LIMIT = 500000;
 
-// Standard NFT Position Manager ABI for close operations
+// Standard NFT Position Manager ABI for close operations (functions + events)
 const NPM_ABI = [
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
   'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
   'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
   'function burn(uint256 tokenId)',
   'function multicall(bytes[] data) payable returns (bytes[] results)',
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+  'event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
 ];
 
 const MAX_UINT128 = BigNumber.from(2).pow(128).sub(1);
@@ -148,12 +150,14 @@ export async function closePosition(
   for (const log of receipt.logs) {
     try {
       const parsed = iface.parseLog(log);
-      if (parsed.name === 'collect' || parsed.name === 'Collect') {
-        amount0Collected = parsed.args.amount0 || parsed.args[4];
-        amount1Collected = parsed.args.amount1 || parsed.args[5];
+      if (parsed.name === 'Collect') {
+        // Collect event: (tokenId, recipient, amount0, amount1)
+        amount0Collected = BigNumber.from(parsed.args.amount0);
+        amount1Collected = BigNumber.from(parsed.args.amount1);
+        logger.info(`Collect event: amount0=${amount0Collected.toString()}, amount1=${amount1Collected.toString()}`);
       }
     } catch {
-      // Not our event
+      // Not an event in our ABI — skip
     }
   }
 

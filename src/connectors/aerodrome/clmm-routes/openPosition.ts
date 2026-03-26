@@ -103,36 +103,61 @@ export async function openPosition(
     throw httpErrors.badRequest('Lower price must be less than upper price');
   }
 
-  // Calculate token amounts
-  let token0Amount = CurrencyAmount.fromRawAmount(token0, 0);
-  let token1Amount = CurrencyAmount.fromRawAmount(token1, 0);
+  // Calculate token amounts — map base/quote to token0/token1
+  let amount0Raw = JSBI.BigInt(0);
+  let amount1Raw = JSBI.BigInt(0);
 
   if (baseTokenAmount !== undefined) {
-    const baseAmountRaw = Math.floor(baseTokenAmount * Math.pow(10, baseTokenObj.decimals));
+    const raw = JSBI.BigInt(Math.floor(baseTokenAmount * Math.pow(10, baseTokenObj.decimals)).toString());
     if (isBaseToken0) {
-      token0Amount = CurrencyAmount.fromRawAmount(token0, JSBI.BigInt(baseAmountRaw.toString()));
+      amount0Raw = raw;
     } else {
-      token1Amount = CurrencyAmount.fromRawAmount(token1, JSBI.BigInt(baseAmountRaw.toString()));
+      amount1Raw = raw;
     }
   }
 
   if (quoteTokenAmount !== undefined) {
-    const quoteAmountRaw = Math.floor(quoteTokenAmount * Math.pow(10, quoteTokenObj.decimals));
+    const raw = JSBI.BigInt(Math.floor(quoteTokenAmount * Math.pow(10, quoteTokenObj.decimals)).toString());
     if (isBaseToken0) {
-      token1Amount = CurrencyAmount.fromRawAmount(token1, JSBI.BigInt(quoteAmountRaw.toString()));
+      amount1Raw = raw;
     } else {
-      token0Amount = CurrencyAmount.fromRawAmount(token0, JSBI.BigInt(quoteAmountRaw.toString()));
+      amount0Raw = raw;
     }
   }
 
-  const position = Position.fromAmounts({
-    pool,
-    tickLower: lowerTick,
-    tickUpper: upperTick,
-    amount0: token0Amount.quotient,
-    amount1: token1Amount.quotient,
-    useFullPrecision: true,
-  });
+  // Use the appropriate Position constructor:
+  // - Both amounts provided: fromAmounts (max position fitting both)
+  // - Only amount0: fromAmount0 (compute matching amount1 from price)
+  // - Only amount1: fromAmount1 (compute matching amount0 from price)
+  const has0 = JSBI.greaterThan(amount0Raw, JSBI.BigInt(0));
+  const has1 = JSBI.greaterThan(amount1Raw, JSBI.BigInt(0));
+
+  let position: Position;
+  if (has0 && has1) {
+    position = Position.fromAmounts({
+      pool,
+      tickLower: lowerTick,
+      tickUpper: upperTick,
+      amount0: amount0Raw,
+      amount1: amount1Raw,
+      useFullPrecision: true,
+    });
+  } else if (has0) {
+    position = Position.fromAmount0({
+      pool,
+      tickLower: lowerTick,
+      tickUpper: upperTick,
+      amount0: amount0Raw,
+      useFullPrecision: true,
+    });
+  } else {
+    position = Position.fromAmount1({
+      pool,
+      tickLower: lowerTick,
+      tickUpper: upperTick,
+      amount1: amount1Raw,
+    });
+  }
 
   logger.info('Creating Aerodrome position:');
   logger.info(`  Token0: ${token0.symbol}, Token1: ${token1.symbol}`);
@@ -144,15 +169,16 @@ export async function openPosition(
   const contracts = aerodrome.getContracts();
   const nftManagerAddress = contracts.nftPositionManager;
 
-  for (const [token, amount] of [
-    [token0, token0Amount],
-    [token1, token1Amount],
+  // Check allowances for the actual position mint amounts
+  for (const [token, mintAmount] of [
+    [token0, position.mintAmounts.amount0],
+    [token1, position.mintAmounts.amount1],
   ] as const) {
-    if (!amount.equalTo(0)) {
+    if (JSBI.greaterThan(mintAmount, JSBI.BigInt(0))) {
       const tokenContract = ethereum.getContract(token.address, wallet);
       const allowance = await ethereum.getERC20Allowance(tokenContract, wallet, nftManagerAddress, token.decimals);
       const currentAllowance = BigNumber.from(allowance.value);
-      const requiredAmount = BigNumber.from(amount.quotient.toString());
+      const requiredAmount = BigNumber.from(mintAmount.toString());
 
       if (currentAllowance.lt(requiredAmount)) {
         throw httpErrors.badRequest(
