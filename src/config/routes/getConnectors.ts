@@ -4,6 +4,7 @@ import { FastifyPluginAsync } from 'fastify';
 import { PancakeswapConfig } from '#src/connectors/pancakeswap/pancakeswap.config';
 
 import { ZeroXConfig } from '../../connectors/0x/0x.config';
+import { AerodromeConfig } from '../../connectors/aerodrome/aerodrome.config';
 import { JupiterConfig } from '../../connectors/jupiter/jupiter.config';
 import { MeteoraConfig } from '../../connectors/meteora/meteora.config';
 import { OrcaConfig } from '../../connectors/orca/orca.config';
@@ -76,6 +77,12 @@ export const connectorsConfig = [
     trading_types: [...OrcaConfig.tradingTypes],
     chain: OrcaConfig.chain,
     networks: [...OrcaConfig.networks],
+  },
+  {
+    name: 'aerodrome',
+    trading_types: [...AerodromeConfig.tradingTypes],
+    chain: AerodromeConfig.chain,
+    networks: [...AerodromeConfig.networks],
   },
 ];
 

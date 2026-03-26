@@ -1,0 +1,9 @@
+# Global settings for Aerodrome Slipstream (Base)
+# Default slippage percentage for swaps (2%)
+slippagePct: 2
+
+# Stake LP positions in CLGauge for AERO rewards
+stakeInGauge: true
+
+# Auto-claim AERO rewards on position close
+autoClaimRewards: true

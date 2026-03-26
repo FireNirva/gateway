@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "slippagePct": {
+      "type": "number",
+      "description": "Default slippage percentage (e.g., 2 for 2%)"
+    },
+    "stakeInGauge": {
+      "type": "boolean",
+      "description": "Stake LP positions in CLGauge for AERO rewards"
+    },
+    "autoClaimRewards": {
+      "type": "boolean",
+      "description": "Auto-claim AERO rewards on position close"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["slippagePct"]
+}

@@ -17,6 +17,7 @@ import { ethereumRoutes } from './chains/ethereum/ethereum.routes';
 import { solanaRoutes } from './chains/solana/solana.routes';
 import { configRoutes } from './config/config.routes';
 import { register0xRoutes } from './connectors/0x/0x.routes';
+import { aerodromeRoutes } from './connectors/aerodrome/aerodrome.routes';
 import { jupiterRoutes } from './connectors/jupiter/jupiter.routes';
 import { meteoraRoutes } from './connectors/meteora/meteora.routes';
 import { orcaRoutes } from './connectors/orca/orca.routes';
@@ -264,6 +265,9 @@ const configureGatewayServer = () => {
     });
     app.register(uniswapRoutes.amm, { prefix: '/connectors/uniswap/amm' });
     app.register(uniswapRoutes.clmm, { prefix: '/connectors/uniswap/clmm' });
+
+    // Aerodrome routes (Slipstream CLMM on Base)
+    app.register(aerodromeRoutes.clmm, { prefix: '/connectors/aerodrome/clmm' });
 
     // 0x routes
     app.register(register0xRoutes);

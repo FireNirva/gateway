@@ -41,6 +41,9 @@ export const mockConfigStorage: Record<string, any> = {
   'orca.slippagePct': 1,
   'uniswap.slippagePct': '0.01',
   'uniswap.ttl': 300,
+  'aerodrome.slippagePct': 2,
+  'aerodrome.stakeInGauge': true,
+  'aerodrome.autoClaimRewards': true,
 };
 
 export const mockConfigManagerV2 = {
@@ -61,6 +64,7 @@ export const mockConfigManagerV2 = {
       meteora: {},
       raydium: {},
       orca: {},
+      aerodrome: {},
     },
     allConfigurations: mockConfigStorage,
   }),
@@ -231,5 +235,8 @@ export function resetAllMocks() {
     'orca.slippagePct': 1,
     'uniswap.slippagePct': '0.01',
     'uniswap.ttl': 300,
+    'aerodrome.slippagePct': 2,
+    'aerodrome.stakeInGauge': true,
+    'aerodrome.autoClaimRewards': true,
   });
 }
