@@ -13,6 +13,7 @@ import { SlipstreamPool } from '../slipstream-sdk';
 const PositionsOwnedRequest = Type.Object({
   network: Type.Optional(Type.String({ examples: ['base'], default: 'base' })),
   walletAddress: Type.String({ examples: ['<ethereum-wallet-address>'] }),
+  poolAddress: Type.Optional(Type.String({ examples: ['0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59'] })),
 });
 
 const PositionsOwnedResponse = Type.Array(PositionInfoSchema);
@@ -21,6 +22,7 @@ export async function getPositionsOwned(
   fastify: FastifyInstance,
   network: string,
   walletAddress?: string,
+  poolAddress?: string,
 ): Promise<PositionInfo[]> {
   const aerodrome = await Aerodrome.getInstance(network);
   const nftManager = aerodrome.getNftManager();
@@ -29,17 +31,49 @@ export async function getPositionsOwned(
     throw fastify.httpErrors.badRequest('Wallet address is required');
   }
 
+  // Collect all token IDs: wallet-owned + gauge-staked
+  const tokenIds: { id: any; staked: boolean }[] = [];
+
+  // 1. Wallet-owned positions (NFTs held directly by wallet)
   const balanceOf = await nftManager.balanceOf(walletAddress);
   const numPositions = balanceOf.toNumber();
+  for (let i = 0; i < numPositions; i++) {
+    try {
+      const tokenId = await nftManager.tokenOfOwnerByIndex(walletAddress, i);
+      tokenIds.push({ id: tokenId, staked: false });
+    } catch (err) {
+      logger.warn(`Error fetching wallet position ${i}: ${(err as Error).message}`);
+    }
+  }
 
-  if (numPositions === 0) {
+  // 2. Gauge-staked positions (NFTs deposited into gauges)
+  // When poolAddress is provided, check that pool's gauge for staked positions
+  if (poolAddress) {
+    try {
+      const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
+      if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
+        const gauge = aerodrome.getGaugeContract(gaugeAddress);
+        const stakedCount = await gauge.stakedLength(walletAddress);
+        for (let i = 0; i < stakedCount.toNumber(); i++) {
+          const tokenId = await gauge.stakedByIndex(walletAddress, i);
+          tokenIds.push({ id: tokenId, staked: true });
+        }
+        if (stakedCount.toNumber() > 0) {
+          logger.info(`Found ${stakedCount.toNumber()} staked position(s) in gauge ${gaugeAddress}`);
+        }
+      }
+    } catch (err) {
+      logger.warn(`Error checking gauge for staked positions: ${(err as Error).message}`);
+    }
+  }
+
+  if (tokenIds.length === 0) {
     return [];
   }
 
   const positions: PositionInfo[] = [];
-  for (let i = 0; i < numPositions; i++) {
+  for (const { id: tokenId, staked } of tokenIds) {
     try {
-      const tokenId = await nftManager.tokenOfOwnerByIndex(walletAddress, i);
       const positionDetails = await nftManager.positions(tokenId);
 
       // Skip positions with no liquidity
@@ -125,7 +159,7 @@ export async function getPositionsOwned(
         price: parseFloat(price),
       });
     } catch (err) {
-      logger.warn(`Error fetching position ${i} for wallet ${walletAddress}: ${(err as Error).message}`);
+      logger.warn(`Error fetching position ${tokenId} for wallet ${walletAddress}: ${(err as Error).message}`);
     }
   }
 
@@ -156,9 +190,9 @@ export const positionsOwnedRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { walletAddress } = request.query;
+        const { walletAddress, poolAddress } = request.query;
         const network = request.query.network;
-        return await getPositionsOwned(fastify, network, walletAddress);
+        return await getPositionsOwned(fastify, network, walletAddress, poolAddress);
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {

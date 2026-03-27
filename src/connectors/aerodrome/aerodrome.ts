@@ -60,6 +60,23 @@ const CL_GAUGE_ABI = [
     stateMutability: 'view',
     type: 'function',
   },
+  {
+    inputs: [{ internalType: 'address', name: 'depositor', type: 'address' }],
+    name: 'stakedLength',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [
+      { internalType: 'address', name: 'depositor', type: 'address' },
+      { internalType: 'uint256', name: 'index', type: 'uint256' },
+    ],
+    name: 'stakedByIndex',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
 ];
 
 // Minimal ABI for pool.gauge()
