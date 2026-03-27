@@ -165,24 +165,34 @@ export async function openPosition(
   logger.info(`  Tick range: [${lowerTick}, ${upperTick}]`);
   logger.info(`  Amount0: ${position.amount0.toSignificant(18)}, Amount1: ${position.amount1.toSignificant(18)}`);
 
-  // Check token allowances
+  // Check token balances and allowances before submitting the transaction
   const contracts = aerodrome.getContracts();
   const nftManagerAddress = contracts.nftPositionManager;
 
-  // Check allowances for the actual position mint amounts
   for (const [token, mintAmount] of [
     [token0, position.mintAmounts.amount0],
     [token1, position.mintAmounts.amount1],
   ] as const) {
     if (JSBI.greaterThan(mintAmount, JSBI.BigInt(0))) {
+      const requiredAmount = BigNumber.from(mintAmount.toString());
+      const requiredHuman = formatTokenAmount(requiredAmount.toString(), token.decimals);
+
+      // Check balance first
       const tokenContract = ethereum.getContract(token.address, wallet);
+      const balanceRaw = await tokenContract.balanceOf(wallet.address);
+      if (BigNumber.from(balanceRaw).lt(requiredAmount)) {
+        const balanceHuman = formatTokenAmount(balanceRaw.toString(), token.decimals);
+        throw httpErrors.badRequest(
+          `Insufficient ${token.symbol} balance: have ${balanceHuman}, need ${requiredHuman}. [INSUFFICIENT_BALANCE]`,
+        );
+      }
+
+      // Then check allowance
       const allowance = await ethereum.getERC20Allowance(tokenContract, wallet, nftManagerAddress, token.decimals);
       const currentAllowance = BigNumber.from(allowance.value);
-      const requiredAmount = BigNumber.from(mintAmount.toString());
-
       if (currentAllowance.lt(requiredAmount)) {
         throw httpErrors.badRequest(
-          `Insufficient ${token.symbol} allowance. Please approve at least ${formatTokenAmount(requiredAmount.toString(), token.decimals)} ${token.symbol} (${token.address}) for the Position Manager (${nftManagerAddress})`,
+          `Insufficient ${token.symbol} allowance. Please approve at least ${requiredHuman} ${token.symbol} (${token.address}) for the Position Manager (${nftManagerAddress})`,
         );
       }
     }
@@ -245,29 +255,62 @@ export async function openPosition(
     try {
       const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
       if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
-        // Approve NFT to gauge
-        const nftApproveContract = new Contract(
+        // Verify NFT ownership before approve (RPC may lag behind receipt)
+        const nftOwnerContract = new Contract(
           nftManagerAddress,
           [
             {
-              inputs: [{ type: 'address' }, { type: 'uint256' }],
-              name: 'approve',
-              outputs: [],
-              stateMutability: 'nonpayable',
+              inputs: [{ type: 'uint256', name: 'tokenId' }],
+              name: 'ownerOf',
+              outputs: [{ type: 'address' }],
+              stateMutability: 'view',
               type: 'function',
             },
           ],
-          wallet,
+          wallet.provider,
         );
-        const approveTx = await nftApproveContract.approve(gaugeAddress, positionId);
-        await ethereum.handleTransactionExecution(approveTx);
 
-        // Deposit into gauge
-        const gauge = aerodrome.getGaugeContract(gaugeAddress);
-        const gaugeWithSigner = gauge.connect(wallet);
-        const depositTx = await gaugeWithSigner.deposit(positionId);
-        await ethereum.handleTransactionExecution(depositTx);
-        logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+        let nftReady = false;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            const owner = await nftOwnerContract.ownerOf(positionId);
+            if (owner.toLowerCase() === walletAddress.toLowerCase()) {
+              nftReady = true;
+              break;
+            }
+          } catch {
+            // NFT not yet visible on RPC — wait and retry
+          }
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+
+        if (!nftReady) {
+          logger.warn(`NFT ${positionId} not found after 10s — skipping gauge staking`);
+        } else {
+          // Approve NFT to gauge
+          const nftApproveContract = new Contract(
+            nftManagerAddress,
+            [
+              {
+                inputs: [{ type: 'address' }, { type: 'uint256' }],
+                name: 'approve',
+                outputs: [],
+                stateMutability: 'nonpayable',
+                type: 'function',
+              },
+            ],
+            wallet,
+          );
+          const approveTx = await nftApproveContract.approve(gaugeAddress, positionId);
+          await ethereum.handleTransactionExecution(approveTx);
+
+          // Deposit into gauge
+          const gauge = aerodrome.getGaugeContract(gaugeAddress);
+          const gaugeWithSigner = gauge.connect(wallet);
+          const depositTx = await gaugeWithSigner.deposit(positionId);
+          await ethereum.handleTransactionExecution(depositTx);
+          logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+        }
       }
     } catch (gaugeError) {
       logger.warn(`Failed to stake in gauge (position still created): ${(gaugeError as Error).message}`);
