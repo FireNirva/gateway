@@ -6,6 +6,8 @@ import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 
 const CLMM_OPEN_POSITION_GAS_LIMIT = 600000;
+const CLMM_GAUGE_APPROVE_GAS_LIMIT = 100000;
+const CLMM_GAUGE_DEPOSIT_GAS_LIMIT = 500000;
 
 import { Ethereum } from '../../../chains/ethereum/ethereum';
 import {
@@ -301,15 +303,67 @@ export async function openPosition(
             ],
             wallet,
           );
-          const approveTx = await nftApproveContract.approve(gaugeAddress, positionId);
-          await ethereum.handleTransactionExecution(approveTx);
+          // Approve NFT — try dynamic estimateGas, fallback to constant
+          logger.info(`Approving NFT ${positionId} for gauge ${gaugeAddress}...`);
+          let approveGasLimit: number;
+          try {
+            const estimated = await nftApproveContract.estimateGas.approve(gaugeAddress, positionId);
+            approveGasLimit = Math.ceil(estimated.toNumber() * 1.2);
+            logger.info(`Approve estimateGas: ${estimated.toNumber()}, using ${approveGasLimit} (1.2x)`);
+          } catch {
+            approveGasLimit = CLMM_GAUGE_APPROVE_GAS_LIMIT;
+            logger.info(`Approve estimateGas failed, using fallback: ${approveGasLimit}`);
+          }
+          const approveGasOptions = await ethereum.prepareGasOptions(undefined, approveGasLimit);
+          const approveTx = await nftApproveContract.approve(gaugeAddress, positionId, approveGasOptions);
+          const approveReceipt = await ethereum.handleTransactionExecution(approveTx);
+          if (!approveReceipt || approveReceipt.status !== 1) {
+            logger.warn(`NFT approve failed or timed out for ${positionId} — skipping gauge staking`);
+          } else {
+            // Wait for RPC state propagation — load-balanced nodes may lag behind
+            await new Promise((r) => setTimeout(r, 4000));
 
-          // Deposit into gauge
-          const gauge = aerodrome.getGaugeContract(gaugeAddress);
-          const gaugeWithSigner = gauge.connect(wallet);
-          const depositTx = await gaugeWithSigner.deposit(positionId);
-          await ethereum.handleTransactionExecution(depositTx);
-          logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+            // Verify approval before deposit
+            const getApprovedContract = new Contract(
+              nftManagerAddress,
+              [
+                {
+                  inputs: [{ type: 'uint256', name: 'tokenId' }],
+                  name: 'getApproved',
+                  outputs: [{ type: 'address' }],
+                  stateMutability: 'view',
+                  type: 'function',
+                },
+              ],
+              wallet.provider,
+            );
+            const approved = await getApprovedContract.getApproved(positionId);
+            if (approved.toLowerCase() !== gaugeAddress.toLowerCase()) {
+              logger.warn(`NFT ${positionId} approve not visible on RPC (got ${approved}) — skipping gauge staking`);
+            } else {
+              // Deposit into gauge — try dynamic estimateGas, fallback to constant
+              const gauge = aerodrome.getGaugeContract(gaugeAddress);
+              const gaugeWithSigner = gauge.connect(wallet);
+              logger.info(`Depositing NFT ${positionId} into gauge...`);
+              let depositGasLimit: number;
+              try {
+                const estimated = await gaugeWithSigner.estimateGas.deposit(positionId);
+                depositGasLimit = Math.ceil(estimated.toNumber() * 1.2);
+                logger.info(`Deposit estimateGas: ${estimated.toNumber()}, using ${depositGasLimit} (1.2x)`);
+              } catch {
+                depositGasLimit = CLMM_GAUGE_DEPOSIT_GAS_LIMIT;
+                logger.info(`Deposit estimateGas failed, using fallback: ${depositGasLimit}`);
+              }
+              const depositGasOptions = await ethereum.prepareGasOptions(undefined, depositGasLimit);
+              const depositTx = await gaugeWithSigner.deposit(positionId, depositGasOptions);
+              const depositReceipt = await ethereum.handleTransactionExecution(depositTx);
+              if (!depositReceipt || depositReceipt.status !== 1) {
+                logger.warn(`Gauge deposit tx failed or timed out for ${positionId}`);
+              } else {
+                logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+              }
+            }
+          }
         }
       }
     } catch (gaugeError) {

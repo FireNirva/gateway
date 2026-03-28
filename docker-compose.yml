@@ -2,10 +2,10 @@ services:
   gateway:
     restart: always
     container_name: gateway
-    # image: hummingbot/gateway:PR543
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: firenirva/gateway:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     ports:
       - "15888:15888"
     volumes:
