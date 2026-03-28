@@ -12,6 +12,8 @@ import {
   AerodromeClaimRewardsResponseType,
 } from '../schemas';
 
+const CLAIM_REWARDS_GAS_LIMIT = 300000;
+
 export async function claimRewards(
   network: string,
   walletAddress: string,
@@ -41,13 +43,54 @@ export async function claimRewards(
 
   // Check earned rewards before claiming
   const earnedBefore = await gaugeWithSigner.earned(tokenId);
+  const aeroAmount = formatTokenAmount(earnedBefore.toString(), 18); // AERO has 18 decimals
+
+  // Skip if no rewards to claim
+  if (earnedBefore.isZero()) {
+    logger.info(`No rewards to claim for position ${tokenId}`);
+    return {
+      signature: '',
+      status: 1,
+      data: {
+        fee: 0,
+        aeroAmount: 0,
+      },
+    };
+  }
+
+  // Dynamic gas estimation with fallback
+  let gasLimit: number;
+  try {
+    const estimated = await gaugeWithSigner.estimateGas.getReward(tokenId);
+    gasLimit = Math.ceil(estimated.toNumber() * 1.2);
+    logger.info(`claimRewards estimateGas: ${estimated.toNumber()}, using ${gasLimit} (1.2x)`);
+  } catch {
+    gasLimit = CLAIM_REWARDS_GAS_LIMIT;
+    logger.info(`claimRewards estimateGas failed, using fallback: ${gasLimit}`);
+  }
+
+  // Use EIP-1559 gas pricing
+  const gasOptions = await ethereum.prepareGasOptions(undefined, gasLimit);
 
   // Claim AERO rewards
-  const tx = await gaugeWithSigner.getReward(tokenId);
+  const tx = await gaugeWithSigner.getReward(tokenId, gasOptions);
   const receipt = await ethereum.handleTransactionExecution(tx);
 
+  if (!receipt || receipt.status !== 1) {
+    logger.warn(`Reward claim failed or timed out for position ${tokenId}`);
+    return {
+      signature: receipt?.transactionHash || '',
+      status: receipt?.status || 0,
+      data: {
+        fee: 0,
+        aeroAmount,
+      },
+    };
+  }
+
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
-  const aeroAmount = formatTokenAmount(earnedBefore.toString(), 18); // AERO has 18 decimals
+
+  logger.info(`Rewards claimed: ${aeroAmount} AERO for position ${tokenId}, gas: ${gasFee} ETH`);
 
   return {
     signature: receipt.transactionHash,
