@@ -57,7 +57,7 @@ export async function closePosition(
   const token1Address: string = position.token1;
   const tickSpacingVal: number = position.tickSpacing;
 
-  // Try to unstake from gauge first
+  // Try to claim rewards and unstake from gauge
   try {
     const factory = aerodrome.getFactory();
     const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacingVal);
@@ -67,8 +67,29 @@ export async function closePosition(
       const gauge = aerodrome.getGaugeContract(gaugeAddress);
       const gaugeWithSigner = gauge.connect(wallet);
 
+      // Claim AERO rewards before unstaking (rewards are lost after withdraw)
       try {
-        // Try withdraw directly — if not staked, it reverts and we catch it
+        const earned = await gaugeWithSigner.earned(positionAddress);
+        if (!earned.isZero()) {
+          const claimGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
+          const claimTx = await gaugeWithSigner.getReward(positionAddress, claimGasOptions);
+          const claimReceipt = await ethereum.handleTransactionExecution(claimTx);
+          if (claimReceipt && claimReceipt.status === 1) {
+            logger.info(
+              `Claimed ${formatTokenAmount(earned.toString(), 18)} AERO rewards before close for ${positionAddress}`,
+            );
+          } else {
+            logger.warn(`Reward claim tx failed or timed out for ${positionAddress} — continuing with close`);
+          }
+        } else {
+          logger.info(`No pending AERO rewards for position ${positionAddress}`);
+        }
+      } catch (err) {
+        logger.warn(`Reward claim failed before close (continuing): ${(err as Error).message}`);
+      }
+
+      try {
+        // Unstake from gauge — if not staked, it reverts and we catch it
         const withdrawTx = await gaugeWithSigner.withdraw(positionAddress);
         await ethereum.handleTransactionExecution(withdrawTx);
         logger.info(`Position ${positionAddress} unstaked from gauge ${gaugeAddress}`);
