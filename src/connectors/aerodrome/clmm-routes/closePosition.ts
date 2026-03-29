@@ -71,7 +71,7 @@ export async function closePosition(
       try {
         let earned;
         try {
-          earned = await gaugeWithSigner.earned(positionAddress);
+          earned = await gaugeWithSigner.earned(walletAddress, positionAddress);
         } catch {
           logger.info(`earned() reverted for ${positionAddress} — skipping reward claim`);
           earned = null;

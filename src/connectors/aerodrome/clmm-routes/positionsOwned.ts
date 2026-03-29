@@ -7,7 +7,7 @@ import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { PositionInfo, PositionInfoSchema } from '../../../schemas/clmm-schema';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount } from '../aerodrome.utils';
+import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount, getUncollectedFees } from '../aerodrome.utils';
 import { SlipstreamPool } from '../slipstream-sdk';
 
 const PositionsOwnedRequest = Type.Object({
@@ -92,12 +92,32 @@ export async function getPositionsOwned(
       const liquidity = positionDetails.liquidity;
       const tickSpacing = positionDetails.tickSpacing;
 
-      const feeAmount0 = formatTokenAmount(positionDetails.tokensOwed0.toString(), token0.decimals);
-      const feeAmount1 = formatTokenAmount(positionDetails.tokensOwed1.toString(), token1.decimals);
-
       // Find pool address
       const factory = aerodrome.getFactory();
       const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacing);
+
+      // Compute real uncollected fees (tokensOwed stays 0 for gauge-staked positions)
+      const tokensOwed0 = formatTokenAmount(positionDetails.tokensOwed0.toString(), token0.decimals);
+      const tokensOwed1 = formatTokenAmount(positionDetails.tokensOwed1.toString(), token1.decimals);
+
+      let feeAmount0 = tokensOwed0;
+      let feeAmount1 = tokensOwed1;
+
+      if (tokensOwed0 === 0 && tokensOwed1 === 0 && !liquidity.isZero()) {
+        const uncollected = await getUncollectedFees(
+          poolAddress,
+          network,
+          tickLower,
+          tickUpper,
+          liquidity,
+          positionDetails.feeGrowthInside0LastX128,
+          positionDetails.feeGrowthInside1LastX128,
+          token0.decimals,
+          token1.decimals,
+        );
+        feeAmount0 = uncollected.fee0;
+        feeAmount1 = uncollected.fee1;
+      }
 
       const [slot0, dynamicFee, poolLiquidity] = await Promise.all([
         getSlot0(poolAddress, network),

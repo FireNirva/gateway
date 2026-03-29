@@ -45,6 +45,42 @@ const POOL_LIQUIDITY_ABI = [
   { inputs: [], name: 'liquidity', outputs: [{ type: 'uint128' }], stateMutability: 'view', type: 'function' },
 ];
 
+// Aerodrome Slipstream ticks() has an extra `stakedLiquidityNet` field vs Uniswap V3
+const POOL_FEE_GROWTH_ABI = [
+  {
+    inputs: [],
+    name: 'feeGrowthGlobal0X128',
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [],
+    name: 'feeGrowthGlobal1X128',
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [{ name: '', type: 'int24' }],
+    name: 'ticks',
+    outputs: [
+      { name: 'liquidityGross', type: 'uint128' },
+      { name: 'liquidityNet', type: 'int128' },
+      { name: 'stakedLiquidityNet', type: 'int128' },
+      { name: 'feeGrowthOutside0X128', type: 'uint256' },
+      { name: 'feeGrowthOutside1X128', type: 'uint256' },
+      { name: 'rewardGrowthOutsideX128', type: 'uint256' },
+      { name: 'tickCumulativeOutside', type: 'int56' },
+      { name: 'secondsPerLiquidityOutsideX128', type: 'uint160' },
+      { name: 'secondsOutside', type: 'uint32' },
+      { name: 'initialized', type: 'bool' },
+    ],
+    stateMutability: 'view',
+    type: 'function',
+  },
+];
+
 const POOL_GAUGE_ABI = [
   { inputs: [], name: 'gauge', outputs: [{ type: 'address' }], stateMutability: 'view', type: 'function' },
 ];
@@ -119,6 +155,90 @@ export async function getPoolGauge(poolAddress: string, network: string): Promis
   const ethereum = await Ethereum.getInstance(network);
   const pool = new Contract(poolAddress, POOL_GAUGE_ABI, ethereum.provider);
   return await pool.gauge();
+}
+
+/**
+ * Compute uncollected LP trading fees for a position.
+ *
+ * For gauge-staked positions, tokensOwed0/1 stays 0 because collect() hasn't
+ * been called. The real fees are computed from feeGrowthInside deltas:
+ *   uncollected = (feeGrowthInsideCurrent - feeGrowthInsideLast) * liquidity / 2^128
+ *
+ * feeGrowthInsideCurrent is derived from pool's global and per-tick data.
+ */
+export async function getUncollectedFees(
+  poolAddress: string,
+  network: string,
+  tickLower: number,
+  tickUpper: number,
+  liquidity: any, // BigNumber
+  feeGrowthInside0LastX128: any, // BigNumber from position
+  feeGrowthInside1LastX128: any, // BigNumber from position
+  token0Decimals: number,
+  token1Decimals: number,
+): Promise<{ fee0: number; fee1: number }> {
+  try {
+    const { BigNumber } = await import('ethers');
+    const ethereum = await Ethereum.getInstance(network);
+    const pool = new Contract(poolAddress, [...POOL_FEE_GROWTH_ABI, ...POOL_SLOT0_ABI], ethereum.provider);
+
+    const [feeGrowthGlobal0, feeGrowthGlobal1, tickLowerData, tickUpperData, slot0] = await Promise.all([
+      pool.feeGrowthGlobal0X128(),
+      pool.feeGrowthGlobal1X128(),
+      pool.ticks(tickLower),
+      pool.ticks(tickUpper),
+      pool.slot0(),
+    ]);
+
+    const currentTick: number = slot0[1];
+    const Q128 = BigNumber.from(2).pow(128);
+    const Q256 = BigNumber.from(2).pow(256);
+
+    // Modular subtraction for uint256 (handles wrap-around like Solidity)
+    const subMod256 = (a: any, b: any) => {
+      const result = a.sub(b);
+      return result.lt(0) ? result.add(Q256) : result;
+    };
+
+    // Compute feeGrowthInside for each token (Uniswap V3 / Slipstream math)
+    const computeFeeGrowthInside = (feeGrowthGlobal: any, feeGrowthOutsideLower: any, feeGrowthOutsideUpper: any) => {
+      // feeGrowthBelow
+      const feeGrowthBelow =
+        currentTick >= tickLower ? feeGrowthOutsideLower : subMod256(feeGrowthGlobal, feeGrowthOutsideLower);
+      // feeGrowthAbove
+      const feeGrowthAbove =
+        currentTick < tickUpper ? feeGrowthOutsideUpper : subMod256(feeGrowthGlobal, feeGrowthOutsideUpper);
+      // feeGrowthInside = global - below - above (mod 2^256)
+      return subMod256(subMod256(feeGrowthGlobal, feeGrowthBelow), feeGrowthAbove);
+    };
+
+    const feeGrowthInside0Current = computeFeeGrowthInside(
+      feeGrowthGlobal0,
+      tickLowerData.feeGrowthOutside0X128,
+      tickUpperData.feeGrowthOutside0X128,
+    );
+    const feeGrowthInside1Current = computeFeeGrowthInside(
+      feeGrowthGlobal1,
+      tickLowerData.feeGrowthOutside1X128,
+      tickUpperData.feeGrowthOutside1X128,
+    );
+
+    // uncollected = (current - last) * liquidity / 2^128 (all mod 2^256)
+    const liq = BigNumber.from(liquidity.toString());
+    const delta0 = subMod256(feeGrowthInside0Current, BigNumber.from(feeGrowthInside0LastX128.toString()));
+    const delta1 = subMod256(feeGrowthInside1Current, BigNumber.from(feeGrowthInside1LastX128.toString()));
+
+    const uncollected0 = delta0.mul(liq).div(Q128);
+    const uncollected1 = delta1.mul(liq).div(Q128);
+
+    const fee0 = formatTokenAmount(uncollected0.toString(), token0Decimals);
+    const fee1 = formatTokenAmount(uncollected1.toString(), token1Decimals);
+
+    return { fee0, fee1 };
+  } catch (error) {
+    logger.warn(`Failed to compute uncollected fees: ${(error as Error).message}`);
+    return { fee0: 0, fee1: 0 };
+  }
 }
 
 /**

@@ -2,6 +2,7 @@ import { Position, tickToPrice } from '@uniswap/v3-sdk';
 import { FastifyPluginAsync, FastifyInstance } from 'fastify';
 import JSBI from 'jsbi';
 
+import { Ethereum } from '../../../chains/ethereum/ethereum';
 import {
   GetPositionInfoRequestType,
   GetPositionInfoRequest,
@@ -10,13 +11,14 @@ import {
 } from '../../../schemas/clmm-schema';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount } from '../aerodrome.utils';
+import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount, getUncollectedFees } from '../aerodrome.utils';
 import { SlipstreamPool } from '../slipstream-sdk';
 
 export async function getPositionInfo(
   fastify: FastifyInstance,
   network: string,
   positionAddress: string,
+  walletAddress?: string,
 ): Promise<PositionInfo> {
   const aerodrome = await Aerodrome.getInstance(network);
   const nftManager = aerodrome.getNftManager();
@@ -39,12 +41,34 @@ export async function getPositionInfo(
   const liquidity = positionDetails.liquidity;
   const tickSpacing = positionDetails.tickSpacing; // Aerodrome-specific (not fee)
 
-  const feeAmount0 = formatTokenAmount(positionDetails.tokensOwed0.toString(), token0.decimals);
-  const feeAmount1 = formatTokenAmount(positionDetails.tokensOwed1.toString(), token1.decimals);
-
   // Find pool address using factory.getPool(token0, token1, tickSpacing)
   const factory = aerodrome.getFactory();
   const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacing);
+
+  // Compute real uncollected fees from feeGrowthInside deltas
+  // (tokensOwed0/1 stays 0 for gauge-staked positions because collect() hasn't been called)
+  const tokensOwed0 = formatTokenAmount(positionDetails.tokensOwed0.toString(), token0.decimals);
+  const tokensOwed1 = formatTokenAmount(positionDetails.tokensOwed1.toString(), token1.decimals);
+
+  let feeAmount0 = tokensOwed0;
+  let feeAmount1 = tokensOwed1;
+
+  // If tokensOwed is zero but position has liquidity, compute from feeGrowth
+  if (tokensOwed0 === 0 && tokensOwed1 === 0 && !liquidity.isZero()) {
+    const uncollected = await getUncollectedFees(
+      poolAddress,
+      network,
+      tickLower,
+      tickUpper,
+      liquidity,
+      positionDetails.feeGrowthInside0LastX128,
+      positionDetails.feeGrowthInside1LastX128,
+      token0.decimals,
+      token1.decimals,
+    );
+    feeAmount0 = uncollected.fee0;
+    feeAmount1 = uncollected.fee1;
+  }
 
   // Build SlipstreamPool for price calculation
   const [slot0, dynamicFee, poolLiquidity] = await Promise.all([
@@ -91,6 +115,29 @@ export async function getPositionInfo(
 
   const [baseFeeAmount, quoteFeeAmount] = isBaseToken0 ? [feeAmount0, feeAmount1] : [feeAmount1, feeAmount0];
 
+  // Query pending AERO gauge rewards if walletAddress is provided
+  let rewardTokenAddress: string | undefined;
+  let rewardAmount: number | undefined;
+
+  if (walletAddress) {
+    try {
+      const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
+      if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
+        const gauge = aerodrome.getGaugeContract(gaugeAddress);
+        const ethereum = await Ethereum.getInstance(network);
+        const wallet = await ethereum.getWallet(walletAddress);
+        if (wallet) {
+          const gaugeWithSigner = gauge.connect(wallet);
+          const earned = await gaugeWithSigner.earned(walletAddress, positionAddress);
+          rewardAmount = formatTokenAmount(earned.toString(), 18); // AERO has 18 decimals
+          rewardTokenAddress = await gaugeWithSigner.rewardToken();
+        }
+      }
+    } catch (err) {
+      logger.debug(`Failed to query gauge rewards for ${positionAddress}: ${(err as Error).message}`);
+    }
+  }
+
   return {
     address: positionAddress,
     poolAddress,
@@ -105,6 +152,8 @@ export async function getPositionInfo(
     lowerPrice: parseFloat(lowerPrice),
     upperPrice: parseFloat(upperPrice),
     price: parseFloat(price),
+    rewardTokenAddress,
+    rewardAmount,
   };
 }
 
@@ -127,6 +176,10 @@ export const positionInfoRoute: FastifyPluginAsync = async (fastify) => {
               description: 'Position NFT token ID',
               examples: ['1234'],
             },
+            walletAddress: {
+              type: 'string',
+              description: 'Wallet address (enables pending reward query)',
+            },
           },
         },
         response: { 200: PositionInfoSchema },
@@ -134,8 +187,8 @@ export const positionInfoRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { network, positionAddress } = request.query;
-        return await getPositionInfo(fastify, network, positionAddress);
+        const { network, positionAddress, walletAddress } = request.query;
+        return await getPositionInfo(fastify, network, positionAddress, walletAddress);
       } catch (e) {
         logger.error(e);
         if (e.statusCode) {

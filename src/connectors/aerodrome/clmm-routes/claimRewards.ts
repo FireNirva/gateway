@@ -41,12 +41,13 @@ export async function claimRewards(
   const gauge = aerodrome.getGaugeContract(gaugeAddress);
   const gaugeWithSigner = gauge.connect(wallet);
 
-  // Check earned rewards before claiming (may revert for freshly staked positions)
+  // Check earned rewards before claiming
+  // Aerodrome CL gauge earned() takes (address, tokenId)
   let earnedBefore;
   try {
-    earnedBefore = await gaugeWithSigner.earned(tokenId);
+    earnedBefore = await gaugeWithSigner.earned(walletAddress, tokenId);
   } catch (err) {
-    logger.info(`earned() reverted for position ${tokenId} (likely freshly staked, no epoch data yet)`);
+    logger.info(`earned() reverted for position ${tokenId}: ${(err as Error).message}`);
     return {
       signature: '',
       status: 1,
