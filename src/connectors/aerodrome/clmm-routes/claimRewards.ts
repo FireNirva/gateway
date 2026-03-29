@@ -41,8 +41,22 @@ export async function claimRewards(
   const gauge = aerodrome.getGaugeContract(gaugeAddress);
   const gaugeWithSigner = gauge.connect(wallet);
 
-  // Check earned rewards before claiming
-  const earnedBefore = await gaugeWithSigner.earned(tokenId);
+  // Check earned rewards before claiming (may revert for freshly staked positions)
+  let earnedBefore;
+  try {
+    earnedBefore = await gaugeWithSigner.earned(tokenId);
+  } catch (err) {
+    logger.info(`earned() reverted for position ${tokenId} (likely freshly staked, no epoch data yet)`);
+    return {
+      signature: '',
+      status: 1,
+      data: {
+        fee: 0,
+        aeroAmount: 0,
+      },
+    };
+  }
+
   const aeroAmount = formatTokenAmount(earnedBefore.toString(), 18); // AERO has 18 decimals
 
   // Skip if no rewards to claim

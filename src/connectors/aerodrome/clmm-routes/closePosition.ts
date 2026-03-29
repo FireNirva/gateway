@@ -69,8 +69,14 @@ export async function closePosition(
 
       // Claim AERO rewards before unstaking (rewards are lost after withdraw)
       try {
-        const earned = await gaugeWithSigner.earned(positionAddress);
-        if (!earned.isZero()) {
+        let earned;
+        try {
+          earned = await gaugeWithSigner.earned(positionAddress);
+        } catch {
+          logger.info(`earned() reverted for ${positionAddress} — skipping reward claim`);
+          earned = null;
+        }
+        if (earned && !earned.isZero()) {
           const claimGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
           const claimTx = await gaugeWithSigner.getReward(positionAddress, claimGasOptions);
           const claimReceipt = await ethereum.handleTransactionExecution(claimTx);
