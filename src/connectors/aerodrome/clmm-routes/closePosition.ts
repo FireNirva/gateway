@@ -58,6 +58,8 @@ export async function closePosition(
   const tickSpacingVal: number = position.tickSpacing;
 
   // Try to claim rewards and unstake from gauge
+  let gaugeUnstaked = false;
+  let positionIsStaked = false;
   try {
     const factory = aerodrome.getFactory();
     const poolAddress = await factory.getPool(token0Address, token1Address, tickSpacingVal);
@@ -67,44 +69,60 @@ export async function closePosition(
       const gauge = aerodrome.getGaugeContract(gaugeAddress);
       const gaugeWithSigner = gauge.connect(wallet);
 
-      // Claim AERO rewards before unstaking (rewards are lost after withdraw)
+      // Check if position is staked in gauge
       try {
-        let earned;
-        try {
-          earned = await gaugeWithSigner.earned(walletAddress, positionAddress);
-        } catch {
-          logger.info(`earned() reverted for ${positionAddress} — skipping reward claim`);
-          earned = null;
-        }
-        if (earned && !earned.isZero()) {
-          const claimGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
-          const claimTx = await gaugeWithSigner.getReward(positionAddress, claimGasOptions);
-          const claimReceipt = await ethereum.handleTransactionExecution(claimTx);
-          if (claimReceipt && claimReceipt.status === 1) {
-            logger.info(
-              `Claimed ${formatTokenAmount(earned.toString(), 18)} AERO rewards before close for ${positionAddress}`,
-            );
-          } else {
-            logger.warn(`Reward claim tx failed or timed out for ${positionAddress} — continuing with close`);
+        const earned = await gaugeWithSigner.earned(walletAddress, positionAddress);
+        positionIsStaked = true; // earned() succeeded = position is staked
+
+        // Claim AERO rewards before unstaking (rewards are lost after withdraw)
+        if (!earned.isZero()) {
+          try {
+            const claimGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
+            const claimTx = await gaugeWithSigner.getReward(positionAddress, claimGasOptions);
+            const claimReceipt = await ethereum.handleTransactionExecution(claimTx);
+            if (claimReceipt && claimReceipt.status === 1) {
+              logger.info(
+                `Claimed ${formatTokenAmount(earned.toString(), 18)} AERO rewards before close for ${positionAddress}`,
+              );
+            } else {
+              logger.warn(`Reward claim tx failed or timed out for ${positionAddress} — continuing with close`);
+            }
+          } catch (err) {
+            logger.warn(`Reward claim failed before close (continuing): ${(err as Error).message}`);
           }
         } else {
           logger.info(`No pending AERO rewards for position ${positionAddress}`);
         }
-      } catch (err) {
-        logger.warn(`Reward claim failed before close (continuing): ${(err as Error).message}`);
+      } catch {
+        logger.info(`earned() reverted for ${positionAddress} — position likely not staked`);
       }
 
-      try {
-        // Unstake from gauge — if not staked, it reverts and we catch it
-        const withdrawTx = await gaugeWithSigner.withdraw(positionAddress);
-        await ethereum.handleTransactionExecution(withdrawTx);
-        logger.info(`Position ${positionAddress} unstaked from gauge ${gaugeAddress}`);
-      } catch (err) {
-        logger.warn(`Gauge withdraw failed (may not be staked): ${(err as Error).message}`);
+      // Unstake from gauge (must succeed before multicall can work)
+      if (positionIsStaked) {
+        try {
+          const withdrawGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
+          const withdrawTx = await gaugeWithSigner.withdraw(positionAddress, withdrawGasOptions);
+          const withdrawReceipt = await ethereum.handleTransactionExecution(withdrawTx);
+          if (withdrawReceipt && withdrawReceipt.status === 1) {
+            gaugeUnstaked = true;
+            logger.info(`Position ${positionAddress} unstaked from gauge ${gaugeAddress}`);
+          } else {
+            logger.error(`Gauge withdraw tx reverted on-chain for ${positionAddress}`);
+          }
+        } catch (err) {
+          logger.error(`Gauge withdraw failed for ${positionAddress}: ${(err as Error).message}`);
+        }
       }
     }
   } catch (err) {
     logger.warn(`Gauge lookup failed: ${(err as Error).message}`);
+  }
+
+  // If position was staked but unstake failed, abort — multicall will fail
+  if (positionIsStaked && !gaugeUnstaked) {
+    throw httpErrors.badRequest(
+      `Position ${positionAddress} is staked in gauge but unstake failed. Cannot close until unstaked.`,
+    );
   }
 
   // Re-read position after potential gauge withdrawal
