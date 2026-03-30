@@ -277,3 +277,27 @@ export const formatTokenAmount = (amount: string | number, decimals: number): nu
     return 0;
   }
 };
+
+/**
+ * Estimate gas dynamically with a safety multiplier, falling back to a constant on failure.
+ * @param estimateFn  async function that returns a BigNumber gas estimate
+ * @param fallbackGas hardcoded fallback gas limit
+ * @param label       human-readable label for logging
+ * @param multiplier  safety multiplier (default 1.3 = 30% buffer)
+ */
+export async function estimateGasWithFallback(
+  estimateFn: () => Promise<any>,
+  fallbackGas: number,
+  label: string,
+  multiplier: number = 1.3,
+): Promise<number> {
+  try {
+    const estimated = await estimateFn();
+    const gasLimit = Math.ceil(estimated.toNumber() * multiplier);
+    logger.info(`${label} estimateGas: ${estimated.toNumber()}, using ${gasLimit} (${multiplier}x)`);
+    return gasLimit;
+  } catch {
+    logger.info(`${label} estimateGas failed, using fallback: ${fallbackGas}`);
+    return fallbackGas;
+  }
+}

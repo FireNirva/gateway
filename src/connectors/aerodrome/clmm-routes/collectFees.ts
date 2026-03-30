@@ -14,7 +14,7 @@ import {
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { formatTokenAmount } from '../aerodrome.utils';
+import { formatTokenAmount, estimateGasWithFallback } from '../aerodrome.utils';
 
 const CLMM_COLLECT_FEES_GAS_LIMIT = 200000;
 
@@ -81,7 +81,12 @@ export async function collectFees(
     wallet,
   );
 
-  const txParams = await ethereum.prepareGasOptions(undefined, CLMM_COLLECT_FEES_GAS_LIMIT);
+  const collectGas = await estimateGasWithFallback(
+    () => nftManagerWithSigner.estimateGas.multicall([calldata], { value: BigNumber.from(value.toString()) }),
+    CLMM_COLLECT_FEES_GAS_LIMIT,
+    'collectFees/multicall',
+  );
+  const txParams = await ethereum.prepareGasOptions(undefined, collectGas);
   txParams.value = BigNumber.from(value.toString());
 
   const tx = await nftManagerWithSigner.multicall([calldata], txParams);

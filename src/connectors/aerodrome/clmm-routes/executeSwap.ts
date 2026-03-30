@@ -7,7 +7,7 @@ import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
 import { AerodromeConfig } from '../aerodrome.config';
-import { getTickSpacing, formatTokenAmount } from '../aerodrome.utils';
+import { getTickSpacing, formatTokenAmount, estimateGasWithFallback } from '../aerodrome.utils';
 import { SLIPSTREAM_SWAP_INTERFACE } from '../slipstream-sdk';
 
 import { getAerodromeClmmQuote } from './quoteSwap';
@@ -82,7 +82,12 @@ export async function executeClmmSwap(
     wallet,
   );
 
-  const txParams = await ethereum.prepareGasOptions(undefined, CLMM_SWAP_GAS_LIMIT);
+  const swapGas = await estimateGasWithFallback(
+    () => swapRouter.estimateGas.multicall([swapCalldata], { value: BigNumber.from(0) }),
+    CLMM_SWAP_GAS_LIMIT,
+    'executeSwap/multicall',
+  );
+  const txParams = await ethereum.prepareGasOptions(undefined, swapGas);
   txParams.value = BigNumber.from(0);
 
   const tx = await swapRouter.multicall([swapCalldata], txParams);

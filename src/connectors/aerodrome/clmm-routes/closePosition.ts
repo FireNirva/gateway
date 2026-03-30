@@ -12,7 +12,7 @@ import {
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { formatTokenAmount } from '../aerodrome.utils';
+import { formatTokenAmount, estimateGasWithFallback } from '../aerodrome.utils';
 
 const CLMM_CLOSE_POSITION_GAS_LIMIT = 500000;
 
@@ -77,7 +77,12 @@ export async function closePosition(
         // Claim AERO rewards before unstaking (rewards are lost after withdraw)
         if (!earned.isZero()) {
           try {
-            const claimGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
+            const claimGas = await estimateGasWithFallback(
+              () => gaugeWithSigner.estimateGas.getReward(positionAddress),
+              300000,
+              'closePosition/claimReward',
+            );
+            const claimGasOptions = await ethereum.prepareGasOptions(undefined, claimGas);
             const claimTx = await gaugeWithSigner.getReward(positionAddress, claimGasOptions);
             const claimReceipt = await ethereum.handleTransactionExecution(claimTx);
             if (claimReceipt && claimReceipt.status === 1) {
@@ -100,7 +105,12 @@ export async function closePosition(
       // Unstake from gauge (must succeed before multicall can work)
       if (positionIsStaked) {
         try {
-          const withdrawGasOptions = await ethereum.prepareGasOptions(undefined, 300000);
+          const withdrawGas = await estimateGasWithFallback(
+            () => gaugeWithSigner.estimateGas.withdraw(positionAddress),
+            500000,
+            'closePosition/gaugeWithdraw',
+          );
+          const withdrawGasOptions = await ethereum.prepareGasOptions(undefined, withdrawGas);
           const withdrawTx = await gaugeWithSigner.withdraw(positionAddress, withdrawGasOptions);
           const withdrawReceipt = await ethereum.handleTransactionExecution(withdrawTx);
           if (withdrawReceipt && withdrawReceipt.status === 1) {
@@ -180,7 +190,12 @@ export async function closePosition(
     `Closing position ${positionAddress}: liquidity=${currentLiquidity.toString()}, multicall with ${calldatas.length} operations`,
   );
 
-  const txParams = await ethereum.prepareGasOptions(undefined, CLMM_CLOSE_POSITION_GAS_LIMIT);
+  const closeGas = await estimateGasWithFallback(
+    () => nftManagerContract.estimateGas.multicall(calldatas, { value: BigNumber.from(0) }),
+    CLMM_CLOSE_POSITION_GAS_LIMIT,
+    'closePosition/multicall',
+  );
+  const txParams = await ethereum.prepareGasOptions(undefined, closeGas);
   txParams.value = BigNumber.from(0);
 
   const tx = await nftManagerContract.multicall(calldatas, txParams);

@@ -4,7 +4,7 @@ import { Ethereum } from '../../../chains/ethereum/ethereum';
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { formatTokenAmount } from '../aerodrome.utils';
+import { formatTokenAmount, estimateGasWithFallback } from '../aerodrome.utils';
 import {
   AerodromeClaimRewardsRequest,
   AerodromeClaimRewardsRequestType,
@@ -73,18 +73,11 @@ export async function claimRewards(
     };
   }
 
-  // Dynamic gas estimation with fallback
-  let gasLimit: number;
-  try {
-    const estimated = await gaugeWithSigner.estimateGas.getReward(tokenId);
-    gasLimit = Math.ceil(estimated.toNumber() * 1.2);
-    logger.info(`claimRewards estimateGas: ${estimated.toNumber()}, using ${gasLimit} (1.2x)`);
-  } catch {
-    gasLimit = CLAIM_REWARDS_GAS_LIMIT;
-    logger.info(`claimRewards estimateGas failed, using fallback: ${gasLimit}`);
-  }
-
-  // Use EIP-1559 gas pricing
+  const gasLimit = await estimateGasWithFallback(
+    () => gaugeWithSigner.estimateGas.getReward(tokenId),
+    CLAIM_REWARDS_GAS_LIMIT,
+    'claimRewards/getReward',
+  );
   const gasOptions = await ethereum.prepareGasOptions(undefined, gasLimit);
 
   // Claim AERO rewards

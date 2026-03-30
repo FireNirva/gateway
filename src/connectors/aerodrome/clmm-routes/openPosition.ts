@@ -28,6 +28,7 @@ import {
   getDynamicFee,
   getPoolLiquidity,
   formatTokenAmount,
+  estimateGasWithFallback,
 } from '../aerodrome.utils';
 import { SlipstreamPool, encodeSlipstreamMint } from '../slipstream-sdk';
 
@@ -233,7 +234,12 @@ export async function openPosition(
     wallet,
   );
 
-  const txParams = await ethereum.prepareGasOptions(undefined, CLMM_OPEN_POSITION_GAS_LIMIT);
+  const mintGas = await estimateGasWithFallback(
+    () => nftManagerWithSigner.estimateGas.multicall([calldata], { value: BigNumber.from(0) }),
+    CLMM_OPEN_POSITION_GAS_LIMIT,
+    'openPosition/mint',
+  );
+  const txParams = await ethereum.prepareGasOptions(undefined, mintGas);
   txParams.value = BigNumber.from(0);
   const tx = await nftManagerWithSigner.multicall([calldata], txParams);
 
@@ -305,15 +311,11 @@ export async function openPosition(
           );
           // Approve NFT — try dynamic estimateGas, fallback to constant
           logger.info(`Approving NFT ${positionId} for gauge ${gaugeAddress}...`);
-          let approveGasLimit: number;
-          try {
-            const estimated = await nftApproveContract.estimateGas.approve(gaugeAddress, positionId);
-            approveGasLimit = Math.ceil(estimated.toNumber() * 1.2);
-            logger.info(`Approve estimateGas: ${estimated.toNumber()}, using ${approveGasLimit} (1.2x)`);
-          } catch {
-            approveGasLimit = CLMM_GAUGE_APPROVE_GAS_LIMIT;
-            logger.info(`Approve estimateGas failed, using fallback: ${approveGasLimit}`);
-          }
+          const approveGasLimit = await estimateGasWithFallback(
+            () => nftApproveContract.estimateGas.approve(gaugeAddress, positionId),
+            CLMM_GAUGE_APPROVE_GAS_LIMIT,
+            'openPosition/gaugeApprove',
+          );
           const approveGasOptions = await ethereum.prepareGasOptions(undefined, approveGasLimit);
           const approveTx = await nftApproveContract.approve(gaugeAddress, positionId, approveGasOptions);
           const approveReceipt = await ethereum.handleTransactionExecution(approveTx);
@@ -345,15 +347,11 @@ export async function openPosition(
               const gauge = aerodrome.getGaugeContract(gaugeAddress);
               const gaugeWithSigner = gauge.connect(wallet);
               logger.info(`Depositing NFT ${positionId} into gauge...`);
-              let depositGasLimit: number;
-              try {
-                const estimated = await gaugeWithSigner.estimateGas.deposit(positionId);
-                depositGasLimit = Math.ceil(estimated.toNumber() * 1.2);
-                logger.info(`Deposit estimateGas: ${estimated.toNumber()}, using ${depositGasLimit} (1.2x)`);
-              } catch {
-                depositGasLimit = CLMM_GAUGE_DEPOSIT_GAS_LIMIT;
-                logger.info(`Deposit estimateGas failed, using fallback: ${depositGasLimit}`);
-              }
+              const depositGasLimit = await estimateGasWithFallback(
+                () => gaugeWithSigner.estimateGas.deposit(positionId),
+                CLMM_GAUGE_DEPOSIT_GAS_LIMIT,
+                'openPosition/gaugeDeposit',
+              );
               const depositGasOptions = await ethereum.prepareGasOptions(undefined, depositGasLimit);
               const depositTx = await gaugeWithSigner.deposit(positionId, depositGasOptions);
               const depositReceipt = await ethereum.handleTransactionExecution(depositTx);

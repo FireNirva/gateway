@@ -15,7 +15,13 @@ import {
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { Aerodrome } from '../aerodrome';
-import { getSlot0, getDynamicFee, getPoolLiquidity, formatTokenAmount } from '../aerodrome.utils';
+import {
+  getSlot0,
+  getDynamicFee,
+  getPoolLiquidity,
+  formatTokenAmount,
+  estimateGasWithFallback,
+} from '../aerodrome.utils';
 import { SlipstreamPool } from '../slipstream-sdk';
 
 const CLMM_REMOVE_LIQUIDITY_GAS_LIMIT = 500000;
@@ -131,7 +137,12 @@ export async function removeLiquidity(
     wallet,
   );
 
-  const txParams = await ethereum.prepareGasOptions(undefined, CLMM_REMOVE_LIQUIDITY_GAS_LIMIT);
+  const removeGas = await estimateGasWithFallback(
+    () => nftManagerWithSigner.estimateGas.multicall([calldata], { value: BigNumber.from(value.toString()) }),
+    CLMM_REMOVE_LIQUIDITY_GAS_LIMIT,
+    'removeLiquidity/multicall',
+  );
+  const txParams = await ethereum.prepareGasOptions(undefined, removeGas);
   txParams.value = BigNumber.from(value.toString());
 
   const tx = await nftManagerWithSigner.multicall([calldata], txParams);
