@@ -1,7 +1,7 @@
 import { Contract } from '@ethersproject/contracts';
 import { CurrencyAmount, Percent } from '@uniswap/sdk-core';
 import { Position, nearestUsableTick } from '@uniswap/v3-sdk';
-import { BigNumber } from 'ethers';
+import { BigNumber, ethers } from 'ethers';
 import { FastifyPluginAsync } from 'fastify';
 import JSBI from 'jsbi';
 
@@ -258,115 +258,147 @@ export async function openPosition(
     }
   }
 
-  // Auto-stake in gauge if configured
+  // Auto-stake in gauge if configured.
+  // Track outcome so the response can flag silent stake failures —
+  // strategies (e.g. lp_trend_rebalancer) need to know if the NFT is in
+  // the wallet but NOT staked, otherwise reward_claim cycles silently
+  // return 0 AERO indefinitely (bug seen 2026-04-23: insufficient gas
+  // for the deposit tx left position 68139473 unstaked for 6+ days).
+  let gaugeStakeStatus: 'staked' | 'skipped' | 'failed' = 'skipped';
+  let gaugeStakeError: string | null = null;
   if (aerodrome.config.stakeInGauge && positionId) {
     try {
-      const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
-      if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
-        // Verify NFT ownership before approve (RPC may lag behind receipt)
-        const nftOwnerContract = new Contract(
-          nftManagerAddress,
-          [
-            {
-              inputs: [{ type: 'uint256', name: 'tokenId' }],
-              name: 'ownerOf',
-              outputs: [{ type: 'address' }],
-              stateMutability: 'view',
-              type: 'function',
-            },
-          ],
-          wallet.provider,
-        );
-
-        let nftReady = false;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          try {
-            const owner = await nftOwnerContract.ownerOf(positionId);
-            if (owner.toLowerCase() === walletAddress.toLowerCase()) {
-              nftReady = true;
-              break;
-            }
-          } catch {
-            // NFT not yet visible on RPC — wait and retry
-          }
-          await new Promise((r) => setTimeout(r, 2000));
-        }
-
-        if (!nftReady) {
-          logger.warn(`NFT ${positionId} not found after 10s — skipping gauge staking`);
-        } else {
-          // Approve NFT to gauge
-          const nftApproveContract = new Contract(
+      // Preflight: verify wallet has enough ETH for approve + deposit.
+      // approve ~80k gas, deposit ~600k gas, ~0.001 ETH headroom at base
+      // mainnet gas price.
+      const balance = await wallet.provider.getBalance(walletAddress);
+      const minRequired = ethers.utils.parseEther('0.0008');
+      if (balance.lt(minRequired)) {
+        gaugeStakeStatus = 'failed';
+        gaugeStakeError = `Insufficient ETH for gauge stake: have ${ethers.utils.formatEther(balance)} ETH, need >= ${ethers.utils.formatEther(minRequired)} ETH for approve+deposit`;
+        logger.warn(`Skipping gauge stake for position ${positionId}: ${gaugeStakeError}`);
+      } else {
+        const gaugeAddress = await aerodrome.getGaugeAddress(poolAddress);
+        if (gaugeAddress && gaugeAddress !== '0x0000000000000000000000000000000000000000') {
+          // Verify NFT ownership before approve (RPC may lag behind receipt)
+          const nftOwnerContract = new Contract(
             nftManagerAddress,
             [
               {
-                inputs: [{ type: 'address' }, { type: 'uint256' }],
-                name: 'approve',
-                outputs: [],
-                stateMutability: 'nonpayable',
+                inputs: [{ type: 'uint256', name: 'tokenId' }],
+                name: 'ownerOf',
+                outputs: [{ type: 'address' }],
+                stateMutability: 'view',
                 type: 'function',
               },
             ],
-            wallet,
+            wallet.provider,
           );
-          // Approve NFT — try dynamic estimateGas, fallback to constant
-          logger.info(`Approving NFT ${positionId} for gauge ${gaugeAddress}...`);
-          const approveGasLimit = await estimateGasWithFallback(
-            () => nftApproveContract.estimateGas.approve(gaugeAddress, positionId),
-            CLMM_GAUGE_APPROVE_GAS_LIMIT,
-            'openPosition/gaugeApprove',
-          );
-          const approveGasOptions = await ethereum.prepareGasOptions(undefined, approveGasLimit);
-          const approveTx = await nftApproveContract.approve(gaugeAddress, positionId, approveGasOptions);
-          const approveReceipt = await ethereum.handleTransactionExecution(approveTx);
-          if (!approveReceipt || approveReceipt.status !== 1) {
-            logger.warn(`NFT approve failed or timed out for ${positionId} — skipping gauge staking`);
-          } else {
-            // Wait for RPC state propagation — load-balanced nodes may lag behind
-            await new Promise((r) => setTimeout(r, 4000));
 
-            // Verify approval before deposit
-            const getApprovedContract = new Contract(
+          let nftReady = false;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+              const owner = await nftOwnerContract.ownerOf(positionId);
+              if (owner.toLowerCase() === walletAddress.toLowerCase()) {
+                nftReady = true;
+                break;
+              }
+            } catch {
+              // NFT not yet visible on RPC — wait and retry
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+
+          if (!nftReady) {
+            logger.warn(`NFT ${positionId} not found after 10s — skipping gauge staking`);
+          } else {
+            // Approve NFT to gauge
+            const nftApproveContract = new Contract(
               nftManagerAddress,
               [
                 {
-                  inputs: [{ type: 'uint256', name: 'tokenId' }],
-                  name: 'getApproved',
-                  outputs: [{ type: 'address' }],
-                  stateMutability: 'view',
+                  inputs: [{ type: 'address' }, { type: 'uint256' }],
+                  name: 'approve',
+                  outputs: [],
+                  stateMutability: 'nonpayable',
                   type: 'function',
                 },
               ],
-              wallet.provider,
+              wallet,
             );
-            const approved = await getApprovedContract.getApproved(positionId);
-            if (approved.toLowerCase() !== gaugeAddress.toLowerCase()) {
-              logger.warn(`NFT ${positionId} approve not visible on RPC (got ${approved}) — skipping gauge staking`);
+            // Approve NFT — try dynamic estimateGas, fallback to constant
+            logger.info(`Approving NFT ${positionId} for gauge ${gaugeAddress}...`);
+            const approveGasLimit = await estimateGasWithFallback(
+              () => nftApproveContract.estimateGas.approve(gaugeAddress, positionId),
+              CLMM_GAUGE_APPROVE_GAS_LIMIT,
+              'openPosition/gaugeApprove',
+            );
+            const approveGasOptions = await ethereum.prepareGasOptions(undefined, approveGasLimit);
+            const approveTx = await nftApproveContract.approve(gaugeAddress, positionId, approveGasOptions);
+            const approveReceipt = await ethereum.handleTransactionExecution(approveTx);
+            if (!approveReceipt || approveReceipt.status !== 1) {
+              logger.warn(`NFT approve failed or timed out for ${positionId} — skipping gauge staking`);
             } else {
-              // Deposit into gauge — try dynamic estimateGas, fallback to constant
-              const gauge = aerodrome.getGaugeContract(gaugeAddress);
-              const gaugeWithSigner = gauge.connect(wallet);
-              logger.info(`Depositing NFT ${positionId} into gauge...`);
-              const depositGasLimit = await estimateGasWithFallback(
-                () => gaugeWithSigner.estimateGas.deposit(positionId),
-                CLMM_GAUGE_DEPOSIT_GAS_LIMIT,
-                'openPosition/gaugeDeposit',
+              // Wait for RPC state propagation — load-balanced nodes may lag behind
+              await new Promise((r) => setTimeout(r, 4000));
+
+              // Verify approval before deposit
+              const getApprovedContract = new Contract(
+                nftManagerAddress,
+                [
+                  {
+                    inputs: [{ type: 'uint256', name: 'tokenId' }],
+                    name: 'getApproved',
+                    outputs: [{ type: 'address' }],
+                    stateMutability: 'view',
+                    type: 'function',
+                  },
+                ],
+                wallet.provider,
               );
-              const depositGasOptions = await ethereum.prepareGasOptions(undefined, depositGasLimit);
-              const depositTx = await gaugeWithSigner.deposit(positionId, depositGasOptions);
-              const depositReceipt = await ethereum.handleTransactionExecution(depositTx);
-              if (!depositReceipt || depositReceipt.status !== 1) {
-                logger.warn(`Gauge deposit tx failed or timed out for ${positionId}`);
+              const approved = await getApprovedContract.getApproved(positionId);
+              if (approved.toLowerCase() !== gaugeAddress.toLowerCase()) {
+                logger.warn(`NFT ${positionId} approve not visible on RPC (got ${approved}) — skipping gauge staking`);
               } else {
-                logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+                // Deposit into gauge — try dynamic estimateGas, fallback to constant
+                const gauge = aerodrome.getGaugeContract(gaugeAddress);
+                const gaugeWithSigner = gauge.connect(wallet);
+                logger.info(`Depositing NFT ${positionId} into gauge...`);
+                const depositGasLimit = await estimateGasWithFallback(
+                  () => gaugeWithSigner.estimateGas.deposit(positionId),
+                  CLMM_GAUGE_DEPOSIT_GAS_LIMIT,
+                  'openPosition/gaugeDeposit',
+                );
+                const depositGasOptions = await ethereum.prepareGasOptions(undefined, depositGasLimit);
+                const depositTx = await gaugeWithSigner.deposit(positionId, depositGasOptions);
+                const depositReceipt = await ethereum.handleTransactionExecution(depositTx);
+                if (!depositReceipt || depositReceipt.status !== 1) {
+                  gaugeStakeStatus = 'failed';
+                  gaugeStakeError = `Gauge deposit tx failed or timed out (status=${depositReceipt?.status ?? 'no-receipt'}, tx=${depositReceipt?.transactionHash ?? ''})`;
+                  logger.warn(`Gauge deposit tx failed or timed out for ${positionId}`);
+                } else {
+                  gaugeStakeStatus = 'staked';
+                  logger.info(`Position ${positionId} staked in gauge ${gaugeAddress}`);
+                }
               }
             }
           }
         }
-      }
+      } // close balance preflight else
     } catch (gaugeError) {
+      gaugeStakeStatus = 'failed';
+      gaugeStakeError = (gaugeError as Error).message;
       logger.warn(`Failed to stake in gauge (position still created): ${(gaugeError as Error).message}`);
     }
+  }
+  if (gaugeStakeStatus === 'failed') {
+    // Loud, structured warning so strategies can either retry or alert.
+    // Silent failures here cause AERO emissions to be missed — see
+    // reward_claim cycles returning 0 AERO indefinitely.
+    logger.warn(
+      `[GAUGE_STAKE_FAILED] position=${positionId} pool=${poolAddress} ` +
+        `wallet=${walletAddress} reason="${gaugeStakeError ?? 'unknown'}"`,
+    );
   }
 
   const gasFee = formatTokenAmount(receipt.gasUsed.mul(receipt.effectiveGasPrice).toString(), 18);
