@@ -67,12 +67,10 @@ export async function executeQuote(
   // Simulate transaction with proper error handling before sending
   await solana.simulateWithErrorHandling(transaction);
 
-  // Send and confirm transaction using Solana's method.
-  // 2026-06-03 de-dup: request PARSED txData from the confirm step so handleConfirmation
-  // can reuse it for balance/fee extraction instead of issuing a 2nd getParsedTransaction.
-  const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction, true);
+  // Send and confirm transaction using Solana's method
+  const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction);
 
-  // Handle confirmation status (side=undefined for router swap; txDataIsParsed=true -> reuse txData)
+  // Handle confirmation status
   const result = await solana.handleConfirmation(
     signature,
     confirmed,
@@ -80,8 +78,6 @@ export async function executeQuote(
     inputToken.address,
     outputToken.address,
     walletAddress,
-    undefined,
-    true,
   );
 
   // Remove quote from cache only after successful execution (confirmed)

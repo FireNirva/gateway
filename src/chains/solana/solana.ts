@@ -1495,7 +1495,6 @@ export class Solana {
 
   async sendAndConfirmRawTransaction(
     transaction: VersionedTransaction | Transaction,
-    useParsed: boolean = false,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
     // Convert Transaction to VersionedTransaction if necessary
     if (!(transaction instanceof VersionedTransaction)) {
@@ -1506,7 +1505,7 @@ export class Solana {
 
       // Get serialized transaction bytes
       const serializedTx = transaction.serialize();
-      return this._sendAndConfirmRawTransaction(serializedTx, useParsed);
+      return this._sendAndConfirmRawTransaction(serializedTx);
     }
 
     // For VersionedTransaction, serialize directly
@@ -1526,9 +1525,6 @@ export class Solana {
     for (let i = 0; i < maxRetries; i++) {
       const txData = useParsed
         ? await this.connection.getParsedTransaction(signature, {
-            // 2026-06-03 de-dup: pin 'confirmed' (matches the unparsed branch + the
-            // confirm-accept level) so the now-reused parsed Fetch#1 stays confirmed-fast.
-            commitment: 'confirmed',
             maxSupportedTransactionVersion: 0,
           })
         : await this.connection.getTransaction(signature, {
@@ -1553,10 +1549,7 @@ export class Solana {
   /**
    * Confirm transaction via WebSocket monitoring
    */
-  private async _confirmViaWebSocket(
-    signature: string,
-    useParsed: boolean = false,
-  ): Promise<{ confirmed: boolean; txData: any } | null> {
+  private async _confirmViaWebSocket(signature: string): Promise<{ confirmed: boolean; txData: any } | null> {
     if (!this.rpcProviderService?.supportsTransactionMonitoring()) {
       return null;
     }
@@ -1568,7 +1561,7 @@ export class Solana {
 
       if (confirmationResult.confirmed) {
         logger.info(`✅ Transaction ${signature} confirmed via WebSocket`);
-        const txData = await this._fetchTransactionWithRetry(signature, 5, 500, useParsed);
+        const txData = await this._fetchTransactionWithRetry(signature);
         if (!txData) {
           logger.warn(`Transaction ${signature} confirmed but data not available`);
         }
@@ -1589,7 +1582,6 @@ export class Solana {
   private async _confirmViaPolling(
     signature: string,
     lastValidBlockHeight: number,
-    useParsed: boolean = false,
   ): Promise<{ confirmed: boolean; txData: any }> {
     logger.info(`🚀 Sent transaction ${signature}, polling for confirmation...`);
 
@@ -1621,7 +1613,7 @@ export class Solana {
             logger.info(
               `✅ Transaction ${signature} confirmed (${status.confirmationStatus}) after ${attempts} attempts`,
             );
-            const txData = await this._fetchTransactionWithRetry(signature, 5, 500, useParsed);
+            const txData = await this._fetchTransactionWithRetry(signature);
             if (status.confirmationStatus === 'processed' && !txData) {
               // Shadow metric for the P1 2B rollout: rate of processed-accepted-but-
               // txData-null. Gate: must stay <=5% (else downstream balance parse falls
@@ -1658,7 +1650,6 @@ export class Solana {
    */
   private async _sendAndConfirmRawTransaction(
     serializedTx: Buffer | Uint8Array,
-    useParsed: boolean = false,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
     const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
 
@@ -1672,12 +1663,12 @@ export class Solana {
       });
 
       // Try WebSocket first, fall back to polling
-      const wsResult = await this._confirmViaWebSocket(signature, useParsed);
+      const wsResult = await this._confirmViaWebSocket(signature);
       if (wsResult !== null) {
         return { ...wsResult, signature };
       }
 
-      const pollingResult = await this._confirmViaPolling(signature, lastValidBlockHeight, useParsed);
+      const pollingResult = await this._confirmViaPolling(signature, lastValidBlockHeight);
       return { ...pollingResult, signature };
     } catch (sendError: any) {
       if (sendError.statusCode === 429) {
@@ -1721,16 +1712,12 @@ export class Solana {
     signature: string,
     owner: string,
     tokens: string[],
-    preFetchedTxData?: any,
   ): Promise<{
     balanceChanges: number[];
     fee: number;
   }> {
-    // 2026-06-03 de-dup: reuse a PARSED txData already fetched during confirm (skips a
-    // getParsedTransaction round-trip). preFetchedTxData MUST be PARSED — the native-SOL
-    // path below reads accountKeys[i].pubkey (ParsedMessageAccount), absent on unparsed
-    // getTransaction. Callers gate this (txDataIsParsed); non-parsed callers pass nothing.
-    const txDetails = preFetchedTxData ?? (await this._fetchTransactionWithRetry(signature, 5, 500, true));
+    // Fetch transaction details with retry (data may not be immediately available after confirmation)
+    const txDetails = await this._fetchTransactionWithRetry(signature, 5, 500, true);
 
     if (!txDetails) {
       throw new Error(`Transaction ${signature} not found after retries`);
@@ -2027,7 +2014,6 @@ export class Solana {
     tokenOut: string,
     walletAddress: string,
     side?: 'BUY' | 'SELL',
-    txDataIsParsed: boolean = false,
   ): Promise<{
     signature: string;
     status: number;
@@ -2042,15 +2028,11 @@ export class Solana {
     };
   }> {
     if (confirmed && txData) {
-      // Transaction confirmed, extract balance changes.
-      // 2026-06-03 de-dup: reuse txData ONLY when the caller fetched it PARSED
-      // (txDataIsParsed). Non-parsed callers pass undefined -> extract refetches (verbatim).
-      const { balanceChanges, fee } = await this.extractBalanceChangesAndFee(
-        signature,
-        walletAddress,
-        [tokenIn, tokenOut],
-        txDataIsParsed ? txData : undefined,
-      );
+      // Transaction confirmed, extract balance changes
+      const { balanceChanges, fee } = await this.extractBalanceChangesAndFee(signature, walletAddress, [
+        tokenIn,
+        tokenOut,
+      ]);
 
       const inputTokenBalanceChange = balanceChanges[0];
       const outputTokenBalanceChange = balanceChanges[1];
