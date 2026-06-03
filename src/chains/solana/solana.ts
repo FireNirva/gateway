@@ -1528,6 +1528,12 @@ export class Solana {
             maxSupportedTransactionVersion: 0,
           })
         : await this.connection.getTransaction(signature, {
+            // NOTE (P1 2B, 2026-06-03): getTransaction's commitment is typed `Finality`
+            // = 'confirmed' | 'finalized' ONLY — 'processed' is a compile error and is
+            // not supported by the RPC. So when _confirmViaPolling accepts at 'processed'
+            // (below), this fetch may return null until the tx flips processed→confirmed
+            // (~1s per step-0). The 5×500ms retry covers that; the P1_PROCESSED_SHADOW
+            // txData_null log measures the residual self-negation rate (gate <=5%).
             commitment: 'confirmed',
             maxSupportedTransactionVersion: 0,
           });
@@ -1594,9 +1600,26 @@ export class Solana {
             return { confirmed: false, txData: null };
           }
 
-          if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
-            logger.info(`✅ Transaction ${signature} confirmed after ${attempts} attempts`);
+          // P1 2B-root (2026-06-03): accept 'processed' too. Chainstack reports a
+          // landed tx as 'processed' for minutes; the bot reconciler already treats
+          // 'processed' as landed (reconciliation.py ~:360). Accepting here lands the
+          // swap at ~1s instead of empty-polling confirmRetryCount times (~96.9s spike).
+          // status.err is checked above (1592) before this gate.
+          if (
+            status.confirmationStatus === 'processed' ||
+            status.confirmationStatus === 'confirmed' ||
+            status.confirmationStatus === 'finalized'
+          ) {
+            logger.info(
+              `✅ Transaction ${signature} confirmed (${status.confirmationStatus}) after ${attempts} attempts`,
+            );
             const txData = await this._fetchTransactionWithRetry(signature);
+            if (status.confirmationStatus === 'processed' && !txData) {
+              // Shadow metric for the P1 2B rollout: rate of processed-accepted-but-
+              // txData-null. Gate: must stay <=5% (else downstream balance parse falls
+              // back to reconcile, partially offsetting the fix). grep P1_PROCESSED_SHADOW.
+              logger.warn(`P1_PROCESSED_SHADOW txData_null sig=${signature} attempts=${attempts}`);
+            }
             return { confirmed: true, txData };
           }
         }
