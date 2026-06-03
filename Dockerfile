@@ -16,8 +16,10 @@ RUN mkdir -p    /home/gateway/conf \
                 /home/gateway/logs \
                 /home/gateway/certs
 
-# Install pnpm
-RUN npm install -g pnpm@latest
+# Install pnpm — pinned (was pnpm@latest, which drifted to a Node-22-requiring
+# release and broke `pnpm install` on the node:20 base with ERR_UNKNOWN_BUILTIN_MODULE
+# 2026-06-03). 10.28.2 satisfies package.json engines pnpm ^10.10.0 + lockfile 9.0.
+RUN npm install -g pnpm@10.28.2
 
 # Copy package files first
 COPY package.json pnpm-lock.yaml ./
