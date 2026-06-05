@@ -166,6 +166,11 @@ export class Jupiter {
     } catch (error) {
       const axiosError = error as any; // Type assertion for axios error
       logger.error('Jupiter API error:', axiosError.message);
+      // B2 (2026-06-05): a 429 rate-limit on the quote must NOT be conflated with
+      // a no-route — surface a distinct retryable error (callers/bot treat it SOFT).
+      if (axiosError.response?.status === 429) {
+        throw new Error('Jupiter rate-limited (HTTP 429) on /quote — retryable, NOT a no-route');
+      }
       if (axiosError.response?.data) {
         logger.error('Jupiter API error response:', axiosError.response.data);
 
@@ -218,8 +223,14 @@ export class Jupiter {
     let swapObj: SwapResponse;
 
     const solanaConfig = getSolanaNetworkConfig(this.solana.network);
-    const retryCount = solanaConfig.confirmRetryCount;
-    const retryInterval = solanaConfig.confirmRetryInterval;
+    // B1 (2026-06-05, 429-attribution audit waxm3zm2p): the route-fetch reused
+    // confirmRetryCount (up to 30) and slept setTimeout(confirmRetryInterval) where
+    // confirmRetryInterval=0.4 was treated as MILLISECONDS -> 30 near-instant /swap
+    // POSTs in ~12ms, self-inflicting Jupiter's per-key 429 burst limit. Fix: cap
+    // attempts + REAL-ms exponential backoff with jitter (computed in the catch).
+    const retryCount = Math.min(solanaConfig.confirmRetryCount, 5);
+    const baseBackoffMs = Math.max(Math.round(solanaConfig.confirmRetryInterval * 1000), 400);
+    const maxBackoffMs = 4000;
 
     for (let attempt = 1; attempt <= retryCount; attempt++) {
       try {
@@ -253,13 +264,26 @@ export class Jupiter {
         );
 
         if (attempt < retryCount) {
-          logger.info(`Waiting ${retryInterval}ms before retry...`);
-          await new Promise((resolve) => setTimeout(resolve, retryInterval));
+          // B1: exponential backoff in REAL ms + jitter; back off harder on 429
+          // so a rate-limited fetch yields the burst limiter instead of hammering.
+          const is429 = axiosError.response?.status === 429;
+          const base = is429 ? baseBackoffMs * 2 : baseBackoffMs;
+          const delayMs = Math.min(base * 2 ** (attempt - 1), maxBackoffMs) + Math.floor(Math.random() * 250);
+          logger.info(`Waiting ${delayMs}ms before route-fetch retry ${attempt + 1}/${retryCount} (429=${is429})...`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
       }
     }
 
     if (!swapObj) {
+      // B2 (2026-06-05): a 429 is a retryable RATE-LIMIT, NOT a no-route. Throw a
+      // distinct error so the bot's rug-marker classifier does not write a false
+      // terminal rug_no_route + permanently abandon a SELLABLE token.
+      if ((lastError as any)?.response?.status === 429) {
+        throw new Error(
+          `Jupiter rate-limited (HTTP 429) on /swap after ${retryCount} attempts — retryable, NOT a no-route`,
+        );
+      }
       throw new Error(`Failed to fetch swap route after ${retryCount} attempts. Last error: ${lastError?.message}`);
     }
 
@@ -299,8 +323,14 @@ export class Jupiter {
     let swapObj: SwapResponse;
 
     const solanaConfig = getSolanaNetworkConfig(this.solana.network);
-    const retryCount = solanaConfig.confirmRetryCount;
-    const retryInterval = solanaConfig.confirmRetryInterval;
+    // B1 (2026-06-05, 429-attribution audit waxm3zm2p): the route-fetch reused
+    // confirmRetryCount (up to 30) and slept setTimeout(confirmRetryInterval) where
+    // confirmRetryInterval=0.4 was treated as MILLISECONDS -> 30 near-instant /swap
+    // POSTs in ~12ms, self-inflicting Jupiter's per-key 429 burst limit. Fix: cap
+    // attempts + REAL-ms exponential backoff with jitter (computed in the catch).
+    const retryCount = Math.min(solanaConfig.confirmRetryCount, 5);
+    const baseBackoffMs = Math.max(Math.round(solanaConfig.confirmRetryInterval * 1000), 400);
+    const maxBackoffMs = 4000;
 
     for (let attempt = 1; attempt <= retryCount; attempt++) {
       try {
@@ -334,13 +364,26 @@ export class Jupiter {
         );
 
         if (attempt < retryCount) {
-          logger.info(`Waiting ${retryInterval}ms before retry...`);
-          await new Promise((resolve) => setTimeout(resolve, retryInterval));
+          // B1: exponential backoff in REAL ms + jitter; back off harder on 429
+          // so a rate-limited fetch yields the burst limiter instead of hammering.
+          const is429 = axiosError.response?.status === 429;
+          const base = is429 ? baseBackoffMs * 2 : baseBackoffMs;
+          const delayMs = Math.min(base * 2 ** (attempt - 1), maxBackoffMs) + Math.floor(Math.random() * 250);
+          logger.info(`Waiting ${delayMs}ms before route-fetch retry ${attempt + 1}/${retryCount} (429=${is429})...`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
       }
     }
 
     if (!swapObj) {
+      // B2 (2026-06-05): a 429 is a retryable RATE-LIMIT, NOT a no-route. Throw a
+      // distinct error so the bot's rug-marker classifier does not write a false
+      // terminal rug_no_route + permanently abandon a SELLABLE token.
+      if ((lastError as any)?.response?.status === 429) {
+        throw new Error(
+          `Jupiter rate-limited (HTTP 429) on /swap after ${retryCount} attempts — retryable, NOT a no-route`,
+        );
+      }
       throw new Error(`Failed to fetch swap route after ${retryCount} attempts. Last error: ${lastError?.message}`);
     }
 
