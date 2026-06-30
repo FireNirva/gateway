@@ -109,11 +109,16 @@ export async function executeSwap(
   await solana.simulateWithErrorHandling(transaction);
   const { confirmed, signature, txData } = await solana.sendAndConfirmRawTransaction(transaction);
 
-  // For balance-change extraction: SELL = base mint in, native SOL out (the
-  // SDK closes the WSOL account so SOL lands natively — pass "SOL", NOT the
-  // WSOL mint, which would net to zero). BUY is the mirror.
-  const tokenIn = side === 'SELL' ? baseMint : 'SOL';
-  const tokenOut = side === 'SELL' ? 'SOL' : baseMint;
+  // For balance-change extraction: SELL = base mint in, native SOL out. The SDK
+  // closes the WSOL account so SOL lands natively — pass the WSOL mint
+  // (SOL_NATIVE_MINT), NOT the literal symbol "SOL". extractBalanceChangesAndFee
+  // (solana.ts) routes to the native-lamport-delta path ONLY when the token ===
+  // the WSOL mint string; the literal "SOL" falls into the SPL branch, finds no
+  // such mint, and returns 0 → amountOut=0 on every confirmed sell (which the bot
+  // would mis-read as a failed sell and retry into a drained wallet). The proven
+  // raydium/jupiter connectors all pass the resolved WSOL mint here. BUY is the mirror.
+  const tokenIn = side === 'SELL' ? baseMint : SOL_NATIVE_MINT;
+  const tokenOut = side === 'SELL' ? SOL_NATIVE_MINT : baseMint;
   const result = await solana.handleConfirmation(signature, confirmed, txData, tokenIn, tokenOut, walletAddress, side);
 
   if (result.status === 1) {

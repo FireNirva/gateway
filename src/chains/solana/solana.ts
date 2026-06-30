@@ -1705,7 +1705,10 @@ export class Solana {
    * Extract balance changes and fee from a transaction for multiple tokens
    * @param signature Transaction signature
    * @param owner Owner address (required for SPL tokens and SOL balance extraction)
-   * @param tokens Array of token mint addresses or 'SOL' for native SOL
+   * @param tokens Array of token mint addresses. For native SOL pass the WSOL mint
+   *   'So11111111111111111111111111111111111111112' (NOT the symbol 'SOL') — only
+   *   that exact mint string triggers the native-lamport-delta path below; any other
+   *   string is treated as an SPL mint and yields 0 if no such mint moved in the tx.
    * @returns Array of balance changes in the same order as tokens, and transaction fee
    */
   async extractBalanceChangesAndFee(
