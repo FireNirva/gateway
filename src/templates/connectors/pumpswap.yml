@@ -1,0 +1,5 @@
+# Global settings for PumpSwap (pump.fun post-graduation AMM)
+# Default slippage percentage for swaps (e.g. 10 = 10%).
+# Higher than other DEXs on purpose: this connector is the SELL fallback for
+# no-route / rug situations where execution certainty matters more than price.
+slippagePct: 10

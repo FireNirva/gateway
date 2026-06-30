@@ -76,6 +76,10 @@ configurations:
     configurationPath: connectors/raydium.yml
     schemaPath: raydium-schema.json
 
+  $namespace pumpswap:
+    configurationPath: connectors/pumpswap.yml
+    schemaPath: pumpswap-schema.json
+
   $namespace orca:
     configurationPath: connectors/orca.yml
     schemaPath: orca-schema.json

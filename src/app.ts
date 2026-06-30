@@ -23,6 +23,7 @@ import { meteoraRoutes } from './connectors/meteora/meteora.routes';
 import { orcaRoutes } from './connectors/orca/orca.routes';
 import { pancakeswapRoutes } from './connectors/pancakeswap/pancakeswap.routes';
 import { pancakeswapSolRoutes } from './connectors/pancakeswap-sol/pancakeswap-sol.routes';
+import { pumpswapRoutes } from './connectors/pumpswap/pumpswap.routes';
 import { raydiumRoutes } from './connectors/raydium/raydium.routes';
 import { uniswapRoutes } from './connectors/uniswap/uniswap.routes';
 import { getHttpsOptions } from './https';
@@ -98,6 +99,10 @@ const swaggerOptions = {
       {
         name: '/connector/orca',
         description: 'Orca connector endpoints',
+      },
+      {
+        name: '/connector/pumpswap',
+        description: 'PumpSwap (pump.fun AMM) connector endpoints',
       },
       {
         name: '/connector/raydium',
@@ -261,6 +266,9 @@ const configureGatewayServer = () => {
 
     // // Orca routes
     app.register(orcaRoutes.clmm, { prefix: '/connectors/orca/clmm' });
+
+    // PumpSwap routes (pump.fun AMM — direct-pool sell fallback)
+    app.register(pumpswapRoutes.amm, { prefix: '/connectors/pumpswap/amm' });
 
     // Raydium routes
     app.register(raydiumRoutes.amm, { prefix: '/connectors/raydium/amm' });
