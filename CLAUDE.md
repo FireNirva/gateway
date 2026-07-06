@@ -1,5 +1,7 @@
 # AI Agent Instructions
 
+> ⚠ **休眠子系统(2026-07-06 戳记):** gateway 镜像/配置已稳定;下文按历史快照阅读,活跃运维(connector conf/watchdog cron)见 `deploy/meme-sniper/CLAUDE.md`。
+
 This file provides guidance to AI coding assistants when working with code in this repository.
 
 ## Build & Command Reference
