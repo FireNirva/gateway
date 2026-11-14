@@ -64,7 +64,7 @@ const fixtureAccount = (mint: string) => {
 const account = (owner: PublicKey, data: Buffer) => ({ owner, data, lamports: 1461600, executable: false, rentEpoch: 0 });
 
 const mintData = (decimals: number): Buffer => {
-  const data = Buffer.alloc(MINT_SIZE);
+  const data = new Uint8Array(MINT_SIZE);
   MintLayout.encode(
     {
       mintAuthorityOption: 0,
@@ -77,11 +77,11 @@ const mintData = (decimals: number): Buffer => {
     },
     data,
   );
-  return data;
+  return Buffer.from(data);
 };
 
 const tokenAccountData = (mint: PublicKey): Buffer => {
-  const data = Buffer.alloc(ACCOUNT_SIZE);
+  const data = new Uint8Array(ACCOUNT_SIZE);
   AccountLayout.encode(
     {
       mint,
@@ -98,7 +98,7 @@ const tokenAccountData = (mint: PublicKey): Buffer => {
     },
     data,
   );
-  return data;
+  return Buffer.from(data);
 };
 
 const SOL = {
