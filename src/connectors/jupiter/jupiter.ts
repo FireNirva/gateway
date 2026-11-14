@@ -1,9 +1,11 @@
 import { Wallet } from '@coral-xyz/anchor';
+import { TokenInfo } from '@solana/spl-token-registry';
 import { VersionedTransaction } from '@solana/web3.js';
 import axios, { AxiosInstance } from 'axios';
 
 import { Solana } from '../../chains/solana/solana';
 import { getSolanaNetworkConfig } from '../../chains/solana/solana.config';
+import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
 import { JupiterConfig } from './jupiter.config';
@@ -123,8 +125,20 @@ export class Jupiter {
     restrictIntermediateTokens: boolean = JupiterConfig.config.restrictIntermediateTokens,
     swapMode: 'ExactIn' | 'ExactOut' = 'ExactIn',
   ): Promise<QuoteResponse> {
-    const inputToken = await this.solana.getToken(inputTokenIdentifier);
-    const outputToken = await this.solana.getToken(outputTokenIdentifier);
+    // Token resolution can hit the Solana RPC (tokens not in the token list). Its failures are not
+    // routing outcomes: keep a 429 as is and give other RPC/network errors a 500, so callers can
+    // tell them apart from "no route".
+    let inputToken: TokenInfo | null;
+    let outputToken: TokenInfo | null;
+    try {
+      inputToken = await this.solana.getToken(inputTokenIdentifier);
+      outputToken = await this.solana.getToken(outputTokenIdentifier);
+    } catch (error) {
+      if (error?.statusCode) {
+        throw error;
+      }
+      throw httpErrors.internalServerError(`Token resolution failed: ${error?.message || String(error)}`);
+    }
 
     if (!inputToken || !outputToken) {
       throw new Error(`Token not found: ${!inputToken ? inputTokenIdentifier : outputTokenIdentifier}`);
