@@ -4,6 +4,7 @@ import {
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   getMint,
+  unpackMint,
   NATIVE_MINT,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
@@ -197,27 +198,43 @@ export class Solana {
       token = tokenList.find((token: TokenInfo) => token.address.toLowerCase() === addressOrSymbol.toLowerCase());
     }
 
-    // If still not found, try to create a new token assuming addressOrSymbol is an address
+    // If still not found, try to create a new token assuming addressOrSymbol is a mint address.
+    // The account owner selects the token program (SPL Token or Token-2022) used to decode the mint.
+    // RPC/network errors propagate: a rate limit or an unreachable node is not "token not found".
     if (!token) {
+      let mintPubkey: PublicKey;
       try {
-        // Validate if it's a valid public key
-        const mintPubkey = new PublicKey(addressOrSymbol);
-
-        // Fetch mint info to get decimals
-        const mintInfo = await getMint(this.connection, mintPubkey);
-
-        // Create a basic token object with fetched decimals
-        token = {
-          address: addressOrSymbol,
-          symbol: `DUMMY_${addressOrSymbol.slice(0, 4)}`,
-          name: `Dummy Token (${addressOrSymbol.slice(0, 8)}...)`,
-          decimals: mintInfo.decimals,
-          chainId: 101,
-        };
+        mintPubkey = new PublicKey(addressOrSymbol);
       } catch (e) {
-        // Not a valid public key or couldn't fetch mint info, return null
+        // Not a valid public key
         return null;
       }
+
+      const accountInfo = await this.connection.getAccountInfo(mintPubkey);
+      if (!accountInfo) {
+        return null;
+      }
+      const programId = accountInfo.owner;
+      if (!programId.equals(TOKEN_PROGRAM_ID) && !programId.equals(TOKEN_2022_PROGRAM_ID)) {
+        return null;
+      }
+
+      let decimals: number;
+      try {
+        decimals = unpackMint(mintPubkey, accountInfo, programId).decimals;
+      } catch (e) {
+        // Owned by a token program but not a mint (e.g. a token account)
+        return null;
+      }
+
+      // Create a basic token object with fetched decimals
+      token = {
+        address: addressOrSymbol,
+        symbol: `DUMMY_${addressOrSymbol.slice(0, 4)}`,
+        name: `Dummy Token (${addressOrSymbol.slice(0, 8)}...)`,
+        decimals,
+        chainId: 101,
+      };
     }
 
     return token;

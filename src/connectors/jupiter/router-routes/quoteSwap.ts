@@ -55,6 +55,11 @@ export async function quoteSwap(
       side === 'BUY' ? 'ExactOut' : 'ExactIn',
     );
   } catch (error) {
+    // Token resolution failures inside getQuote carry an HTTP status (RPC rate limit or network
+    // error); they are not "no route", so pass them through unchanged.
+    if (error?.statusCode) {
+      throw error;
+    }
     // Pass through Jupiter's error with context
     const errorMessage = error?.message || String(error);
     const tokenPair = `${sanitizeString(baseToken)} -> ${sanitizeString(quoteToken)}`;
